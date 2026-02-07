@@ -9,7 +9,11 @@ let package = Package(
     ],
     products: [
         .library(name: "YepSVG", targets: ["YepSVG"]),
-        .library(name: "YepSVGSwiftUI", targets: ["YepSVGSwiftUI"])
+        .library(name: "YepSVGSwiftUI", targets: ["YepSVGSwiftUI"]),
+        .library(name: "YepSVGKingfisher", targets: ["YepSVGKingfisher"])
+    ],
+    dependencies: [
+        .package(url: "https://github.com/onevcat/Kingfisher.git", from: "7.0.0")
     ],
     targets: [
         .target(
@@ -52,6 +56,14 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("SwiftUI")
             ]
+        ),
+        .target(
+            name: "YepSVGKingfisher",
+            dependencies: [
+                "YepSVG",
+                .product(name: "Kingfisher", package: "Kingfisher")
+            ],
+            path: "Sources/YepSVGKingfisher"
         ),
         .testTarget(
             name: "YepSVGTests",

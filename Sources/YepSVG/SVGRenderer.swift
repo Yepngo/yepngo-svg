@@ -23,7 +23,7 @@ public final class SVGRenderer: @unchecked Sendable {
         try await preflightExternalResourcesIfNeeded(svgData: svgData, options: options)
 
         return try await Task.detached(priority: .userInitiated) {
-            try SVGCoreBridge.render(svgData: svgData, options: options)
+            try Self.renderSync(svgData: svgData, options: options)
         }.value
     }
 
@@ -37,6 +37,13 @@ public final class SVGRenderer: @unchecked Sendable {
 
         let rewritten = rewriteRelativeResourceReferences(in: data, relativeTo: svgFileURL.deletingLastPathComponent())
         return try await render(svgData: rewritten, options: options)
+    }
+
+    public static func renderSync(svgData: Data, options: SVGRenderOptions) throws -> UIImage {
+        guard !svgData.isEmpty else {
+            throw SVGRenderError.invalidDocument("Input data is empty")
+        }
+        return try SVGCoreBridge.render(svgData: svgData, options: options)
     }
 
     private func preflightExternalResourcesIfNeeded(svgData: Data, options: SVGRenderOptions) async throws {

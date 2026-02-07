@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <regex>
 #include <sstream>
 #include <stack>
@@ -33,6 +34,80 @@ std::map<std::string, std::string> ParseAttributes(const std::string& raw) {
 
 bool IsWhitespace(char c) {
     return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+std::string DecodeXmlEntities(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '&') {
+            out.push_back(text[i]);
+            continue;
+        }
+
+        const size_t semi = text.find(';', i + 1);
+        if (semi == std::string::npos) {
+            out.push_back(text[i]);
+            continue;
+        }
+
+        const std::string entity = text.substr(i + 1, semi - i - 1);
+        auto append_code_point = [&out](uint32_t codepoint) {
+            if (codepoint <= 0x7F) {
+                out.push_back(static_cast<char>(codepoint));
+            } else if (codepoint <= 0x7FF) {
+                out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            } else if (codepoint <= 0xFFFF) {
+                out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            } else {
+                out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            }
+        };
+
+        bool replaced = true;
+        if (entity == "lt") {
+            out.push_back('<');
+        } else if (entity == "gt") {
+            out.push_back('>');
+        } else if (entity == "amp") {
+            out.push_back('&');
+        } else if (entity == "quot") {
+            out.push_back('"');
+        } else if (entity == "apos") {
+            out.push_back('\'');
+        } else if (!entity.empty() && entity[0] == '#') {
+            uint32_t codepoint = 0;
+            try {
+                if (entity.size() > 2 && (entity[1] == 'x' || entity[1] == 'X')) {
+                    codepoint = static_cast<uint32_t>(std::stoul(entity.substr(2), nullptr, 16));
+                } else {
+                    codepoint = static_cast<uint32_t>(std::stoul(entity.substr(1), nullptr, 10));
+                }
+            } catch (...) {
+                replaced = false;
+            }
+            if (replaced) {
+                append_code_point(codepoint);
+            }
+        } else {
+            replaced = false;
+        }
+
+        if (replaced) {
+            i = semi;
+        } else {
+            out.push_back(text[i]);
+        }
+    }
+
+    return out;
 }
 
 std::map<std::string, std::string> ParseDoctypeEntities(const std::string& doctype_decl) {
@@ -227,9 +302,11 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
         }
 
         if (token[0] != '<') {
-            const auto content = Trim(token);
-            if (!content.empty() && !node_stack.empty()) {
-                node_stack.back().text += content;
+            if (!node_stack.empty()) {
+                if (token.find_first_not_of(" \t\r\n") == std::string::npos) {
+                    continue;
+                }
+                node_stack.back().text += DecodeXmlEntities(token);
             }
             continue;
         }
@@ -242,6 +319,14 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
             if (node_stack.size() <= 1) {
                 error.code = RenderErrorCode::kInvalidDocument;
                 error.message = "Malformed SVG: unexpected closing tag";
+                return std::nullopt;
+            }
+
+            std::string close_tag = token.substr(2, token.size() - 3);
+            close_tag = Trim(close_tag);
+            if (!close_tag.empty() && node_stack.back().name != close_tag) {
+                error.code = RenderErrorCode::kInvalidDocument;
+                error.message = "Malformed SVG: closing tag mismatch";
                 return std::nullopt;
             }
 
@@ -275,6 +360,9 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
         XmlNode node;
         node.name = tag_name;
         node.attributes = ParseAttributes(attr_blob);
+        for (auto& [key, value] : node.attributes) {
+            value = DecodeXmlEntities(value);
+        }
 
         if (self_closing) {
             node_stack.back().children.push_back(std::move(node));

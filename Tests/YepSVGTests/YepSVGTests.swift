@@ -450,6 +450,7 @@ final class YepSVGTests: XCTestCase {
         for sample in samplePoints {
             let actual = try pixelAt(cgImage: cgImage, x: sample.x, y: sample.y)
             let expected = try pixelAt(cgImage: referenceImage, x: sample.x, y: sample.y)
+            print("DEBUG composite-02 \(sample.name) actual=(\(actual.r),\(actual.g),\(actual.b),\(actual.a)) expected=(\(expected.r),\(expected.g),\(expected.b),\(expected.a))")
 
             XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)),
                                      tolerance,
@@ -469,6 +470,98 @@ final class YepSVGTests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(quantizedReference.count, 4, "Reference should have multiple distinct blend outcomes")
         XCTAssertGreaterThanOrEqual(quantizedActual.count, 4, "Rendered output collapsed blend bands to too few distinct colors")
+    }
+
+    func testFeImagePrimitiveFeedsCompositeUsingReferencedSVGElements() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="160" height="160" viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+          <defs>
+            <path id="Blue100" d="M 0 0 L 150 0 L 150 150 z" fill="#00ffff"/>
+            <path id="Red100" d="M 0 0 L 0 150 L 150 0 z" fill="#ff00ff"/>
+            <filter id="compositeOver">
+              <feImage xlink:href="#Blue100" result="blue"/>
+              <feImage xlink:href="#Red100" result="red"/>
+              <feComposite in2="blue" in="red" operator="over"/>
+            </filter>
+          </defs>
+          <rect x="0" y="0" width="150" height="150" filter="url(#compositeOver)"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let redRegion = try pixelAt(cgImage: cgImage, x: 20, y: 40)
+        let blueRegion = try pixelAt(cgImage: cgImage, x: 120, y: 80)
+        let outside = try pixelAt(cgImage: cgImage, x: 155, y: 155)
+
+        XCTAssertGreaterThan(redRegion.r, 180)
+        XCTAssertLessThan(redRegion.g, 80)
+        XCTAssertGreaterThan(redRegion.b, 180)
+
+        XCTAssertLessThan(blueRegion.r, 80)
+        XCTAssertGreaterThan(blueRegion.g, 180)
+        XCTAssertGreaterThan(blueRegion.b, 180)
+
+        XCTAssertLessThan(outside.a, 20)
+    }
+
+    func testFiltersComposite02ArithmeticBandsMatchReference() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/filters-composite-02-b.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-filters-composite-02-b.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: referenceImage.width, height: referenceImage.height)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Samples in top arithmetic and bottom arithmetic50 cells:
+        // red-only, overlap, blue-only, and outside area.
+        let samplePoints: [(name: String, x: Int, y: Int)] = [
+            ("top-red", 387, 194),
+            ("top-overlap", 411, 178),
+            ("top-blue", 419, 186),
+            ("top-outside", 379, 218),
+            ("bottom-red", 387, 274),
+            ("bottom-overlap", 411, 258),
+            ("bottom-blue", 419, 266),
+            ("bottom-outside", 379, 298),
+        ]
+
+        let tolerance = 42
+        for sample in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: sample.x, y: sample.y)
+            let expected = try pixelAt(cgImage: referenceImage, x: sample.x, y: sample.y)
+
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)),
+                                     tolerance,
+                                     "\(sample.name) red mismatch actual=\(actual.r) expected=\(expected.r)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)),
+                                     tolerance,
+                                     "\(sample.name) green mismatch actual=\(actual.g) expected=\(expected.g)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)),
+                                     tolerance,
+                                     "\(sample.name) blue mismatch actual=\(actual.b) expected=\(expected.b)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.a) - Int(expected.a)),
+                                     tolerance,
+                                     "\(sample.name) alpha mismatch actual=\(actual.a) expected=\(expected.a)")
+        }
     }
 
     func testFiltersColor01FixtureColorMatrixAndCompositeMatchReference() async throws {
