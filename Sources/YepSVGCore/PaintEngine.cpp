@@ -16,6 +16,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace csvg {
@@ -69,6 +70,58 @@ using PatternMap = std::map<std::string, PatternDefinition>;
 using NodeIdMap = std::map<std::string, const XmlNode*>;
 using ColorProfileMap = std::map<std::string, std::string>;
 
+enum class CssCombinator {
+    kNone,
+    kDescendant,
+    kChild,
+    kAdjacent,
+};
+
+enum class CssAttributeOperator {
+    kExists,
+    kEquals,
+    kIncludes,
+    kDashMatch,
+};
+
+struct CssAttributeSelector {
+    std::string name;
+    CssAttributeOperator op = CssAttributeOperator::kExists;
+    std::string value;
+};
+
+struct CssSimpleSelector {
+    std::string tag = "*";
+    std::optional<std::string> id;
+    std::vector<std::string> classes;
+    std::vector<CssAttributeSelector> attributes;
+    bool first_child = false;
+};
+
+struct CssSelectorStep {
+    CssSimpleSelector simple;
+    CssCombinator combinator_to_prev = CssCombinator::kNone;
+};
+
+struct CssSelector {
+    std::vector<CssSelectorStep> steps;
+    int specificity = 0;
+};
+
+struct CssRule {
+    std::vector<CssSelector> selectors;
+    std::map<std::string, std::string> declarations;
+    size_t source_order = 0;
+};
+
+struct CssStylesheet {
+    std::vector<CssRule> rules;
+    std::unordered_map<const XmlNode*, const XmlNode*> parent_by_node;
+    std::unordered_map<const XmlNode*, size_t> index_in_parent;
+};
+
+const CssStylesheet* g_active_stylesheet = nullptr;
+
 std::string Trim(const std::string& value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
@@ -81,6 +134,612 @@ std::string Trim(const std::string& value) {
 std::string Lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
+}
+
+std::string CssLocalName(const std::string& name) {
+    const auto separator = name.rfind(':');
+    if (separator == std::string::npos) {
+        return Lower(name);
+    }
+    return Lower(name.substr(separator + 1));
+}
+
+std::string RemoveCssComments(const std::string& css_text) {
+    std::string out;
+    out.reserve(css_text.size());
+    size_t cursor = 0;
+    while (cursor < css_text.size()) {
+        const auto comment_start = css_text.find("/*", cursor);
+        if (comment_start == std::string::npos) {
+            out.append(css_text.substr(cursor));
+            break;
+        }
+        out.append(css_text.substr(cursor, comment_start - cursor));
+        const auto comment_end = css_text.find("*/", comment_start + 2);
+        if (comment_end == std::string::npos) {
+            break;
+        }
+        cursor = comment_end + 2;
+    }
+    return out;
+}
+
+std::vector<std::string> SplitCssTopLevel(const std::string& text, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string current;
+    int bracket_depth = 0;
+    int paren_depth = 0;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+
+    for (char c : text) {
+        if (!in_double_quote && c == '\'') {
+            in_single_quote = !in_single_quote;
+            current.push_back(c);
+            continue;
+        }
+        if (!in_single_quote && c == '"') {
+            in_double_quote = !in_double_quote;
+            current.push_back(c);
+            continue;
+        }
+        if (in_single_quote || in_double_quote) {
+            current.push_back(c);
+            continue;
+        }
+
+        if (c == '[') {
+            ++bracket_depth;
+        } else if (c == ']' && bracket_depth > 0) {
+            --bracket_depth;
+        } else if (c == '(') {
+            ++paren_depth;
+        } else if (c == ')' && paren_depth > 0) {
+            --paren_depth;
+        }
+
+        if (c == delimiter && bracket_depth == 0 && paren_depth == 0) {
+            const auto trimmed = Trim(current);
+            if (!trimmed.empty()) {
+                tokens.push_back(trimmed);
+            }
+            current.clear();
+            continue;
+        }
+        current.push_back(c);
+    }
+
+    const auto trailing = Trim(current);
+    if (!trailing.empty()) {
+        tokens.push_back(trailing);
+    }
+    return tokens;
+}
+
+bool IsCssNameStart(char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '-';
+}
+
+bool IsCssNameChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ':';
+}
+
+std::optional<std::string> ParseCssName(const std::string& token, size_t& index) {
+    if (index >= token.size() || !IsCssNameStart(token[index])) {
+        return std::nullopt;
+    }
+    const size_t start = index;
+    ++index;
+    while (index < token.size() && IsCssNameChar(token[index])) {
+        ++index;
+    }
+    return token.substr(start, index - start);
+}
+
+bool ParseCssAttributeSelectorToken(const std::string& raw, CssAttributeSelector& out) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    size_t index = 0;
+    auto name = ParseCssName(trimmed, index);
+    if (!name.has_value()) {
+        return false;
+    }
+    out.name = *name;
+    out.op = CssAttributeOperator::kExists;
+    out.value.clear();
+
+    while (index < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[index]))) {
+        ++index;
+    }
+    if (index >= trimmed.size()) {
+        return true;
+    }
+
+    if (trimmed.compare(index, 2, "~=") == 0) {
+        out.op = CssAttributeOperator::kIncludes;
+        index += 2;
+    } else if (trimmed.compare(index, 2, "|=") == 0) {
+        out.op = CssAttributeOperator::kDashMatch;
+        index += 2;
+    } else if (trimmed[index] == '=') {
+        out.op = CssAttributeOperator::kEquals;
+        ++index;
+    } else {
+        return false;
+    }
+
+    while (index < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[index]))) {
+        ++index;
+    }
+    if (index >= trimmed.size()) {
+        return false;
+    }
+
+    if (trimmed[index] == '\'' || trimmed[index] == '"') {
+        const char quote = trimmed[index++];
+        const size_t start = index;
+        while (index < trimmed.size() && trimmed[index] != quote) {
+            ++index;
+        }
+        if (index >= trimmed.size()) {
+            return false;
+        }
+        out.value = trimmed.substr(start, index - start);
+    } else {
+        out.value = Trim(trimmed.substr(index));
+    }
+    return true;
+}
+
+std::optional<CssSimpleSelector> ParseCssSimpleSelector(const std::string& token, int& specificity) {
+    CssSimpleSelector simple;
+    const auto trimmed = Trim(token);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+
+    size_t index = 0;
+    if (trimmed[index] == '*') {
+        simple.tag = "*";
+        ++index;
+    } else if (auto tag = ParseCssName(trimmed, index); tag.has_value()) {
+        simple.tag = CssLocalName(*tag);
+        ++specificity;
+    }
+
+    while (index < trimmed.size()) {
+        const char c = trimmed[index];
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            ++index;
+            continue;
+        }
+
+        if (c == '#') {
+            ++index;
+            auto id = ParseCssName(trimmed, index);
+            if (!id.has_value()) {
+                return std::nullopt;
+            }
+            simple.id = *id;
+            specificity += 100;
+            continue;
+        }
+
+        if (c == '.') {
+            ++index;
+            auto klass = ParseCssName(trimmed, index);
+            if (!klass.has_value()) {
+                return std::nullopt;
+            }
+            simple.classes.push_back(*klass);
+            specificity += 10;
+            continue;
+        }
+
+        if (c == '[') {
+            const auto close = trimmed.find(']', index + 1);
+            if (close == std::string::npos) {
+                return std::nullopt;
+            }
+            CssAttributeSelector attr;
+            if (!ParseCssAttributeSelectorToken(trimmed.substr(index + 1, close - index - 1), attr)) {
+                return std::nullopt;
+            }
+            simple.attributes.push_back(std::move(attr));
+            specificity += 10;
+            index = close + 1;
+            continue;
+        }
+
+        if (c == ':') {
+            ++index;
+            auto pseudo = ParseCssName(trimmed, index);
+            if (!pseudo.has_value()) {
+                return std::nullopt;
+            }
+            if (Lower(*pseudo) != "first-child") {
+                return std::nullopt;
+            }
+            simple.first_child = true;
+            specificity += 10;
+            continue;
+        }
+
+        return std::nullopt;
+    }
+
+    return simple;
+}
+
+std::optional<CssSelector> ParseCssSelector(const std::string& selector_text) {
+    std::vector<std::string> compounds;
+    std::vector<CssCombinator> combinators;
+
+    size_t index = 0;
+    while (index < selector_text.size()) {
+        while (index < selector_text.size() && std::isspace(static_cast<unsigned char>(selector_text[index]))) {
+            ++index;
+        }
+        if (index >= selector_text.size()) {
+            break;
+        }
+
+        const size_t start = index;
+        while (index < selector_text.size() &&
+               selector_text[index] != '>' &&
+               selector_text[index] != '+' &&
+               !std::isspace(static_cast<unsigned char>(selector_text[index]))) {
+            ++index;
+        }
+        const auto compound = Trim(selector_text.substr(start, index - start));
+        if (compound.empty()) {
+            return std::nullopt;
+        }
+        compounds.push_back(compound);
+
+        size_t space_begin = index;
+        while (index < selector_text.size() && std::isspace(static_cast<unsigned char>(selector_text[index]))) {
+            ++index;
+        }
+        const bool had_space = index > space_begin;
+        if (index >= selector_text.size()) {
+            break;
+        }
+
+        if (selector_text[index] == '>') {
+            combinators.push_back(CssCombinator::kChild);
+            ++index;
+            continue;
+        }
+        if (selector_text[index] == '+') {
+            combinators.push_back(CssCombinator::kAdjacent);
+            ++index;
+            continue;
+        }
+        if (had_space) {
+            combinators.push_back(CssCombinator::kDescendant);
+            continue;
+        }
+        return std::nullopt;
+    }
+
+    if (compounds.empty() || combinators.size() + 1 != compounds.size()) {
+        return std::nullopt;
+    }
+
+    CssSelector selector;
+    int specificity = 0;
+    std::vector<CssSimpleSelector> parsed;
+    parsed.reserve(compounds.size());
+    for (const auto& compound : compounds) {
+        auto simple = ParseCssSimpleSelector(compound, specificity);
+        if (!simple.has_value()) {
+            return std::nullopt;
+        }
+        parsed.push_back(std::move(*simple));
+    }
+
+    selector.steps.reserve(parsed.size());
+    for (size_t left = parsed.size(); left > 0; --left) {
+        const size_t i = left - 1;
+        CssSelectorStep step;
+        step.simple = parsed[i];
+        if (i > 0) {
+            step.combinator_to_prev = combinators[i - 1];
+        }
+        selector.steps.push_back(std::move(step));
+    }
+    selector.specificity = specificity;
+    return selector;
+}
+
+std::map<std::string, std::string> ParseCssDeclarations(const std::string& declarations_text) {
+    std::map<std::string, std::string> declarations;
+    for (const auto& declaration : SplitCssTopLevel(declarations_text, ';')) {
+        const auto separator = declaration.find(':');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string name = Lower(Trim(declaration.substr(0, separator)));
+        std::string value = Trim(declaration.substr(separator + 1));
+        if (name.empty() || value.empty()) {
+            continue;
+        }
+        const auto important = Lower(value);
+        const auto bang_pos = important.rfind("!important");
+        if (bang_pos != std::string::npos && bang_pos + 10 == important.size()) {
+            value = Trim(value.substr(0, bang_pos));
+        }
+        declarations[name] = value;
+    }
+    return declarations;
+}
+
+void CollectNodeHierarchyMaps(const XmlNode& node,
+                              const XmlNode* parent,
+                              size_t index,
+                              CssStylesheet& stylesheet) {
+    if (parent != nullptr) {
+        stylesheet.parent_by_node[&node] = parent;
+        stylesheet.index_in_parent[&node] = index;
+    }
+    for (size_t i = 0; i < node.children.size(); ++i) {
+        CollectNodeHierarchyMaps(node.children[i], &node, i, stylesheet);
+    }
+}
+
+void CollectEmbeddedCssBlocks(const XmlNode& node, std::vector<std::string>& css_blocks) {
+    if (CssLocalName(node.name) == "style") {
+        const auto trimmed = Trim(node.text);
+        if (!trimmed.empty()) {
+            css_blocks.push_back(trimmed);
+        }
+    }
+    for (const auto& child : node.children) {
+        CollectEmbeddedCssBlocks(child, css_blocks);
+    }
+}
+
+CssStylesheet BuildCssStylesheet(const XmlNode& root) {
+    CssStylesheet stylesheet;
+    CollectNodeHierarchyMaps(root, nullptr, 0, stylesheet);
+
+    std::vector<std::string> css_blocks;
+    CollectEmbeddedCssBlocks(root, css_blocks);
+    if (css_blocks.empty()) {
+        return stylesheet;
+    }
+
+    size_t source_order = 0;
+    for (const auto& block : css_blocks) {
+        const std::string css_text = RemoveCssComments(block);
+        size_t cursor = 0;
+        while (cursor < css_text.size()) {
+            const auto open = css_text.find('{', cursor);
+            if (open == std::string::npos) {
+                break;
+            }
+            const auto close = css_text.find('}', open + 1);
+            if (close == std::string::npos) {
+                break;
+            }
+
+            const auto selector_text = Trim(css_text.substr(cursor, open - cursor));
+            const auto declaration_text = css_text.substr(open + 1, close - open - 1);
+            cursor = close + 1;
+
+            if (selector_text.empty()) {
+                continue;
+            }
+
+            CssRule rule;
+            rule.source_order = ++source_order;
+            rule.declarations = ParseCssDeclarations(declaration_text);
+            if (rule.declarations.empty()) {
+                continue;
+            }
+
+            for (const auto& selector_token : SplitCssTopLevel(selector_text, ',')) {
+                if (auto selector = ParseCssSelector(selector_token); selector.has_value()) {
+                    rule.selectors.push_back(std::move(*selector));
+                }
+            }
+            if (!rule.selectors.empty()) {
+                stylesheet.rules.push_back(std::move(rule));
+            }
+        }
+    }
+    return stylesheet;
+}
+
+bool HasClass(const std::string& class_value, const std::string& class_name) {
+    std::stringstream stream(class_value);
+    std::string token;
+    while (stream >> token) {
+        if (token == class_name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MatchesCssAttributeSelector(const XmlNode* node, const CssAttributeSelector& selector) {
+    if (node == nullptr) {
+        return false;
+    }
+    const auto attr_it = node->attributes.find(selector.name);
+    if (attr_it == node->attributes.end()) {
+        return false;
+    }
+    const std::string attr_value = attr_it->second;
+
+    switch (selector.op) {
+        case CssAttributeOperator::kExists:
+            return true;
+        case CssAttributeOperator::kEquals:
+            return attr_value == selector.value;
+        case CssAttributeOperator::kIncludes: {
+            std::stringstream stream(attr_value);
+            std::string token;
+            while (stream >> token) {
+                if (token == selector.value) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        case CssAttributeOperator::kDashMatch:
+            return attr_value == selector.value ||
+                (attr_value.size() > selector.value.size() &&
+                 attr_value.compare(0, selector.value.size(), selector.value) == 0 &&
+                 attr_value[selector.value.size()] == '-');
+    }
+    return false;
+}
+
+bool MatchesCssSimpleSelector(const XmlNode* node,
+                              const CssSimpleSelector& selector,
+                              const CssStylesheet& stylesheet) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (selector.tag != "*" && CssLocalName(node->name) != selector.tag) {
+        return false;
+    }
+    if (selector.id.has_value()) {
+        const auto id_it = node->attributes.find("id");
+        if (id_it == node->attributes.end() || id_it->second != *selector.id) {
+            return false;
+        }
+    }
+    for (const auto& class_name : selector.classes) {
+        const auto class_it = node->attributes.find("class");
+        if (class_it == node->attributes.end() || !HasClass(class_it->second, class_name)) {
+            return false;
+        }
+    }
+    for (const auto& attr_selector : selector.attributes) {
+        if (!MatchesCssAttributeSelector(node, attr_selector)) {
+            return false;
+        }
+    }
+    if (selector.first_child) {
+        const auto index_it = stylesheet.index_in_parent.find(node);
+        if (index_it == stylesheet.index_in_parent.end() || index_it->second != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const XmlNode* CssParentOf(const CssStylesheet& stylesheet, const XmlNode* node) {
+    if (node == nullptr) {
+        return nullptr;
+    }
+    const auto it = stylesheet.parent_by_node.find(node);
+    if (it == stylesheet.parent_by_node.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+const XmlNode* CssPreviousSibling(const CssStylesheet& stylesheet, const XmlNode* node) {
+    const auto parent = CssParentOf(stylesheet, node);
+    if (parent == nullptr) {
+        return nullptr;
+    }
+    const auto index_it = stylesheet.index_in_parent.find(node);
+    if (index_it == stylesheet.index_in_parent.end() || index_it->second == 0) {
+        return nullptr;
+    }
+    const size_t sibling_index = index_it->second - 1;
+    if (sibling_index >= parent->children.size()) {
+        return nullptr;
+    }
+    return &parent->children[sibling_index];
+}
+
+bool MatchesCssSelectorAtStep(const CssSelector& selector,
+                              size_t step_index,
+                              const XmlNode* node,
+                              const CssStylesheet& stylesheet) {
+    if (!MatchesCssSimpleSelector(node, selector.steps[step_index].simple, stylesheet)) {
+        return false;
+    }
+    if (step_index + 1 >= selector.steps.size()) {
+        return true;
+    }
+
+    const auto combinator = selector.steps[step_index].combinator_to_prev;
+    if (combinator == CssCombinator::kChild) {
+        const auto parent = CssParentOf(stylesheet, node);
+        return parent != nullptr && MatchesCssSelectorAtStep(selector, step_index + 1, parent, stylesheet);
+    }
+    if (combinator == CssCombinator::kAdjacent) {
+        const auto previous_sibling = CssPreviousSibling(stylesheet, node);
+        return previous_sibling != nullptr && MatchesCssSelectorAtStep(selector, step_index + 1, previous_sibling, stylesheet);
+    }
+    if (combinator == CssCombinator::kDescendant) {
+        auto ancestor = CssParentOf(stylesheet, node);
+        while (ancestor != nullptr) {
+            if (MatchesCssSelectorAtStep(selector, step_index + 1, ancestor, stylesheet)) {
+                return true;
+            }
+            ancestor = CssParentOf(stylesheet, ancestor);
+        }
+        return false;
+    }
+    return false;
+}
+
+bool MatchesCssSelector(const CssSelector& selector, const XmlNode* node, const CssStylesheet& stylesheet) {
+    if (selector.steps.empty() || node == nullptr) {
+        return false;
+    }
+    return MatchesCssSelectorAtStep(selector, 0, node, stylesheet);
+}
+
+std::map<std::string, std::string> ResolveMatchedCssProperties(const XmlNode& node) {
+    struct Winner {
+        std::string value;
+        int specificity = 0;
+        size_t source_order = 0;
+    };
+
+    std::map<std::string, std::string> resolved;
+    if (g_active_stylesheet == nullptr) {
+        return resolved;
+    }
+
+    std::map<std::string, Winner> winners;
+    for (const auto& rule : g_active_stylesheet->rules) {
+        int matched_specificity = -1;
+        for (const auto& selector : rule.selectors) {
+            if (MatchesCssSelector(selector, &node, *g_active_stylesheet)) {
+                matched_specificity = std::max(matched_specificity, selector.specificity);
+            }
+        }
+        if (matched_specificity < 0) {
+            continue;
+        }
+
+        for (const auto& [property, value] : rule.declarations) {
+            auto current = winners.find(property);
+            if (current == winners.end() ||
+                matched_specificity > current->second.specificity ||
+                (matched_specificity == current->second.specificity && rule.source_order >= current->second.source_order)) {
+                winners[property] = Winner{value, matched_specificity, rule.source_order};
+            }
+        }
+    }
+
+    for (const auto& [property, winner] : winners) {
+        resolved[property] = winner.value;
+    }
+    return resolved;
 }
 
 bool IsNumberStart(char c) {
@@ -572,14 +1231,23 @@ std::map<std::string, std::string> ParseInlineStyle(const std::string& style_tex
     return out;
 }
 
-std::optional<std::string> ReadAttrOrStyle(const XmlNode& node, const std::map<std::string, std::string>& inline_style, const std::string& key) {
+std::optional<std::string> ReadAttrOrStyle(const XmlNode& node,
+                                           const std::map<std::string, std::string>& inline_style,
+                                           const std::map<std::string, std::string>* matched_css_properties,
+                                           const std::string& key) {
+    const auto inline_it = inline_style.find(key);
+    if (inline_it != inline_style.end()) {
+        return inline_it->second;
+    }
+    if (matched_css_properties != nullptr) {
+        const auto matched_it = matched_css_properties->find(key);
+        if (matched_it != matched_css_properties->end()) {
+            return matched_it->second;
+        }
+    }
     const auto attr_it = node.attributes.find(key);
     if (attr_it != node.attributes.end()) {
         return attr_it->second;
-    }
-    const auto css_it = inline_style.find(key);
-    if (css_it != inline_style.end()) {
-        return css_it->second;
     }
     return std::nullopt;
 }
@@ -621,6 +1289,24 @@ double ParseOffset(const std::string& raw) {
 }
 
 double ParseDouble(const std::string& raw, double fallback) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return fallback;
+    }
+
+    if (*end_ptr == '%') {
+        return parsed / 100.0;
+    }
+    return parsed;
+}
+
+double ParseObjectBoundingBoxLength(const std::string& raw, double fallback) {
     const auto trimmed = Trim(raw);
     if (trimmed.empty()) {
         return fallback;
@@ -1435,7 +2121,7 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
             : std::map<std::string, std::string>{};
 
         Color gradient_color = StyleResolver::ParseColor("black");
-        if (const auto color_value = ReadAttrOrStyle(node, gradient_inline_style, "color"); color_value.has_value()) {
+        if (const auto color_value = ReadAttrOrStyle(node, gradient_inline_style, nullptr, "color"); color_value.has_value()) {
             const auto parsed = StyleResolver::ParseColor(*color_value);
             if (parsed.is_valid && !parsed.is_none) {
                 gradient_color = parsed;
@@ -1495,18 +2181,18 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
             stop.opacity = 1.0;
 
             Color stop_current_color = gradient_color;
-            if (const auto stop_color_prop = ReadAttrOrStyle(stop_node, inline_style, "color"); stop_color_prop.has_value()) {
+            if (const auto stop_color_prop = ReadAttrOrStyle(stop_node, inline_style, nullptr, "color"); stop_color_prop.has_value()) {
                 const auto parsed = StyleResolver::ParseColor(*stop_color_prop);
                 if (parsed.is_valid && !parsed.is_none) {
                     stop_current_color = parsed;
                 }
             }
 
-            if (const auto offset = ReadAttrOrStyle(stop_node, inline_style, "offset"); offset.has_value()) {
+            if (const auto offset = ReadAttrOrStyle(stop_node, inline_style, nullptr, "offset"); offset.has_value()) {
                 stop.offset = ParseOffset(*offset);
             }
 
-            if (const auto stop_color = ReadAttrOrStyle(stop_node, inline_style, "stop-color"); stop_color.has_value()) {
+            if (const auto stop_color = ReadAttrOrStyle(stop_node, inline_style, nullptr, "stop-color"); stop_color.has_value()) {
                 const auto stop_color_lower = Lower(Trim(*stop_color));
                 if (stop_color_lower == "currentcolor") {
                     stop.color = stop_current_color;
@@ -1518,7 +2204,7 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
                 }
             }
 
-            if (const auto stop_opacity = ReadAttrOrStyle(stop_node, inline_style, "stop-opacity"); stop_opacity.has_value()) {
+            if (const auto stop_opacity = ReadAttrOrStyle(stop_node, inline_style, nullptr, "stop-opacity"); stop_opacity.has_value()) {
                 stop.opacity = std::clamp(ParseDouble(*stop_opacity, 1.0), 0.0, 1.0);
             }
 
@@ -1658,8 +2344,10 @@ struct PixelBounds {
     size_t max_y = 0;
 };
 
-std::optional<std::string> ResolveFilterID(const XmlNode& node, const std::map<std::string, std::string>& inline_style) {
-    const auto filter_value = ReadAttrOrStyle(node, inline_style, "filter");
+std::optional<std::string> ResolveFilterID(const XmlNode& node,
+                                           const std::map<std::string, std::string>& inline_style,
+                                           const std::map<std::string, std::string>* matched_css_properties) {
+    const auto filter_value = ReadAttrOrStyle(node, inline_style, matched_css_properties, "filter");
     if (!filter_value.has_value()) {
         return std::nullopt;
     }
@@ -1795,8 +2483,8 @@ PixelSurface MakeFloodSurface(size_t width, size_t height, const XmlNode& primit
         ? ParseInlineStyle(style_it->second)
         : std::map<std::string, std::string>{};
 
-    const auto flood_color_text = ReadAttrOrStyle(primitive, inline_style, "flood-color").value_or("black");
-    const auto flood_opacity_text = ReadAttrOrStyle(primitive, inline_style, "flood-opacity").value_or("1");
+    const auto flood_color_text = ReadAttrOrStyle(primitive, inline_style, nullptr, "flood-color").value_or("black");
+    const auto flood_opacity_text = ReadAttrOrStyle(primitive, inline_style, nullptr, "flood-opacity").value_or("1");
     auto flood_color = StyleResolver::ParseColor(flood_color_text);
     if (!flood_color.is_valid || flood_color.is_none) {
         flood_color = StyleResolver::ParseColor("black");
@@ -2210,6 +2898,89 @@ PixelSurface CropSurface(const PixelSurface& surface, const PixelBounds& bounds)
     return cropped;
 }
 
+std::pair<double, double> ResolveIntrinsicNodeViewport(const XmlNode& node,
+                                                       const GeometryEngine& geometry_engine,
+                                                       double fallback_width,
+                                                       double fallback_height) {
+    const auto shape = geometry_engine.Build(node);
+    if (!shape.has_value()) {
+        return {std::max(1.0, fallback_width), std::max(1.0, fallback_height)};
+    }
+
+    double width = fallback_width;
+    double height = fallback_height;
+
+    switch (shape->type) {
+        case ShapeType::kRect:
+        case ShapeType::kImage:
+            width = shape->width;
+            height = shape->height;
+            break;
+        case ShapeType::kCircle:
+            width = shape->rx * 2.0;
+            height = shape->rx * 2.0;
+            break;
+        case ShapeType::kEllipse:
+            width = shape->rx * 2.0;
+            height = shape->ry * 2.0;
+            break;
+        case ShapeType::kLine: {
+            if (shape->points.size() >= 2) {
+                width = std::abs(shape->points[1].x - shape->points[0].x);
+                height = std::abs(shape->points[1].y - shape->points[0].y);
+            }
+            break;
+        }
+        case ShapeType::kPolygon:
+        case ShapeType::kPolyline: {
+            if (!shape->points.empty()) {
+                double min_x = shape->points.front().x;
+                double max_x = shape->points.front().x;
+                double min_y = shape->points.front().y;
+                double max_y = shape->points.front().y;
+                for (const auto& point : shape->points) {
+                    min_x = std::min(min_x, point.x);
+                    max_x = std::max(max_x, point.x);
+                    min_y = std::min(min_y, point.y);
+                    max_y = std::max(max_y, point.y);
+                }
+                width = max_x - min_x;
+                height = max_y - min_y;
+            }
+            break;
+        }
+        case ShapeType::kPath: {
+            if (!shape->path_data.empty()) {
+                CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+                CGContextRef context = CGBitmapContextCreate(nullptr,
+                                                             2,
+                                                             2,
+                                                             8,
+                                                             2 * 4,
+                                                             color_space,
+                                                             static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+                CGColorSpaceRelease(color_space);
+                if (context != nullptr) {
+                    BuildPathFromData(context, shape->path_data);
+                    if (CGPathRef path = CGContextCopyPath(context)) {
+                        const CGRect bounds = CGPathGetPathBoundingBox(path);
+                        width = bounds.size.width;
+                        height = bounds.size.height;
+                        CGPathRelease(path);
+                    }
+                    CGContextRelease(context);
+                }
+            }
+            break;
+        }
+        case ShapeType::kText:
+        case ShapeType::kUnknown:
+            break;
+    }
+
+    return {std::max(1.0, width), std::max(1.0, height)};
+}
+
 void DrawCGImageToSurface(PixelSurface& surface, CGImageRef image, double x, double y, double width, double height) {
     if (image == nullptr || surface.width == 0 || surface.height == 0 || !(width > 0.0) || !(height > 0.0)) {
         return;
@@ -2267,8 +3038,11 @@ PixelSurface RenderImageFilterPrimitive(const XmlNode& primitive,
         const PixelBounds source_bounds = ResolveUsableBounds(source_surface, ComputeNonTransparentBounds(source_surface));
         const double source_width = static_cast<double>(source_bounds.max_x - source_bounds.min_x + 1);
         const double source_height = static_cast<double>(source_bounds.max_y - source_bounds.min_y + 1);
-        const GeometryEngine primitive_geometry_engine(std::max(source_width, 1.0),
-                                                       std::max(source_height, 1.0));
+        const auto intrinsic_size = ResolveIntrinsicNodeViewport(*it->second,
+                                                                 geometry_engine,
+                                                                 source_width,
+                                                                 source_height);
+        const GeometryEngine primitive_geometry_engine(intrinsic_size.first, intrinsic_size.second);
 
         RenderError local_error;
         const auto rendered = RenderNodeToSurface(*it->second,
@@ -2888,21 +3662,6 @@ PixelSurface ApplyDisplacementMapFilter(const PixelSurface& input, const PixelSu
     return output;
 }
 
-std::array<double, 3> ParseDistantLightDirection(const XmlNode& primitive) {
-    for (const auto& child : primitive.children) {
-        if (LocalName(child.name) != "fedistantlight") {
-            continue;
-        }
-        const double azimuth = ParseDouble(child.attributes.count("azimuth") ? child.attributes.at("azimuth") : "", 0.0) * M_PI / 180.0;
-        const double elevation = ParseDouble(child.attributes.count("elevation") ? child.attributes.at("elevation") : "", 0.0) * M_PI / 180.0;
-        const double x = std::cos(elevation) * std::cos(azimuth);
-        const double y = std::cos(elevation) * std::sin(azimuth);
-        const double z = std::sin(elevation);
-        return {x, y, z};
-    }
-    return {0.0, 0.0, 1.0};
-}
-
 std::array<double, 3> Normalize3(double x, double y, double z) {
     const double length = std::sqrt((x * x) + (y * y) + (z * z));
     if (length <= 1e-9) {
@@ -2911,14 +3670,71 @@ std::array<double, 3> Normalize3(double x, double y, double z) {
     return {x / length, y / length, z / length};
 }
 
+enum class LightSourceType {
+    kDistant,
+    kPoint,
+    kSpot,
+};
+
+struct LightSource {
+    LightSourceType type = LightSourceType::kDistant;
+    std::array<double, 3> direction = {0.0, 0.0, 1.0};
+    std::array<double, 3> position = {0.0, 0.0, 10.0};
+    std::array<double, 3> points_at = {0.0, 0.0, 0.0};
+    double spot_exponent = 1.0;
+    double limiting_cone_angle = -1.0;
+};
+
+LightSource ParseLightSource(const XmlNode& primitive) {
+    for (const auto& child : primitive.children) {
+        const std::string light_name = LocalName(child.name);
+        if (light_name == "fedistantlight") {
+            const double azimuth = ParseDouble(child.attributes.count("azimuth") ? child.attributes.at("azimuth") : "", 0.0) * M_PI / 180.0;
+            const double elevation = ParseDouble(child.attributes.count("elevation") ? child.attributes.at("elevation") : "", 0.0) * M_PI / 180.0;
+            LightSource source;
+            source.type = LightSourceType::kDistant;
+            source.direction = Normalize3(std::cos(elevation) * std::cos(azimuth),
+                                          std::cos(elevation) * std::sin(azimuth),
+                                          std::sin(elevation));
+            return source;
+        }
+        if (light_name == "fepointlight") {
+            LightSource source;
+            source.type = LightSourceType::kPoint;
+            source.position = {
+                ParseDouble(child.attributes.count("x") ? child.attributes.at("x") : "", 0.0),
+                ParseDouble(child.attributes.count("y") ? child.attributes.at("y") : "", 0.0),
+                ParseDouble(child.attributes.count("z") ? child.attributes.at("z") : "", 0.0),
+            };
+            return source;
+        }
+        if (light_name == "fespotlight") {
+            LightSource source;
+            source.type = LightSourceType::kSpot;
+            const double light_x = ParseDouble(child.attributes.count("x") ? child.attributes.at("x") : "", 0.0);
+            const double light_y = ParseDouble(child.attributes.count("y") ? child.attributes.at("y") : "", 0.0);
+            const double light_z = ParseDouble(child.attributes.count("z") ? child.attributes.at("z") : "", 0.0);
+            source.position = {light_x, light_y, light_z};
+            source.points_at = {
+                ParseDouble(child.attributes.count("pointsAtX") ? child.attributes.at("pointsAtX") : "", light_x),
+                ParseDouble(child.attributes.count("pointsAtY") ? child.attributes.at("pointsAtY") : "", light_y),
+                ParseDouble(child.attributes.count("pointsAtZ") ? child.attributes.at("pointsAtZ") : "", 0.0),
+            };
+            source.spot_exponent = std::max(0.0, ParseDouble(child.attributes.count("specularExponent") ? child.attributes.at("specularExponent") : "", 1.0));
+            source.limiting_cone_angle = ParseDouble(child.attributes.count("limitingConeAngle") ? child.attributes.at("limitingConeAngle") : "", -1.0);
+            return source;
+        }
+    }
+    return {};
+}
+
 PixelSurface ApplyLightingFilter(const PixelSurface& input, const XmlNode& primitive, bool specular) {
     PixelSurface output = MakeTransparentSurface(input.width, input.height);
     if (input.width == 0 || input.height == 0) {
         return output;
     }
 
-    const auto light_dir_raw = ParseDistantLightDirection(primitive);
-    const auto light_dir = Normalize3(light_dir_raw[0], light_dir_raw[1], light_dir_raw[2]);
+    const LightSource light_source = ParseLightSource(primitive);
     const double surface_scale = ParseDouble(primitive.attributes.count("surfaceScale") ? primitive.attributes.at("surfaceScale") : "", 1.0);
     const double diffuse_constant = ParseDouble(primitive.attributes.count("diffuseConstant") ? primitive.attributes.at("diffuseConstant") : "", 1.0);
     const double specular_constant = ParseDouble(primitive.attributes.count("specularConstant") ? primitive.attributes.at("specularConstant") : "", 1.0);
@@ -2928,7 +3744,7 @@ PixelSurface ApplyLightingFilter(const PixelSurface& input, const XmlNode& primi
     const auto inline_style = style_it != primitive.attributes.end()
         ? ParseInlineStyle(style_it->second)
         : std::map<std::string, std::string>{};
-    Color light_color = StyleResolver::ParseColor(ReadAttrOrStyle(primitive, inline_style, "lighting-color").value_or("white"));
+    Color light_color = StyleResolver::ParseColor(ReadAttrOrStyle(primitive, inline_style, nullptr, "lighting-color").value_or("white"));
     if (!light_color.is_valid || light_color.is_none) {
         light_color = StyleResolver::ParseColor("white");
     }
@@ -2946,29 +3762,183 @@ PixelSurface ApplyLightingFilter(const PixelSurface& input, const XmlNode& primi
             const double height_right = alpha_at(x + 1, y);
             const double height_up = alpha_at(x, y - 1);
             const double height_down = alpha_at(x, y + 1);
+            const double height_center = alpha_at(x, y);
             const auto normal = Normalize3(-(height_right - height_left) * 0.5,
                                            -(height_down - height_up) * 0.5,
                                            1.0);
 
+            std::array<double, 3> light_vector = light_source.direction;
+            double spot_factor = 1.0;
+            if (light_source.type == LightSourceType::kPoint || light_source.type == LightSourceType::kSpot) {
+                light_vector = Normalize3(light_source.position[0] - static_cast<double>(x),
+                                          light_source.position[1] - static_cast<double>(y),
+                                          light_source.position[2] - height_center);
+                if (light_source.type == LightSourceType::kSpot) {
+                    const auto light_axis = Normalize3(light_source.points_at[0] - light_source.position[0],
+                                                       light_source.points_at[1] - light_source.position[1],
+                                                       light_source.points_at[2] - light_source.position[2]);
+                    const auto light_to_surface = Normalize3(-light_vector[0], -light_vector[1], -light_vector[2]);
+                    const double cosine = std::clamp(light_axis[0] * light_to_surface[0] +
+                                                         light_axis[1] * light_to_surface[1] +
+                                                         light_axis[2] * light_to_surface[2],
+                                                     -1.0,
+                                                     1.0);
+                    if (light_source.limiting_cone_angle >= 0.0) {
+                        const double cone_cos = std::cos(light_source.limiting_cone_angle * M_PI / 180.0);
+                        if (cosine < cone_cos) {
+                            spot_factor = 0.0;
+                        }
+                    }
+                    if (spot_factor > 0.0) {
+                        spot_factor = std::pow(std::max(0.0, cosine), light_source.spot_exponent);
+                    }
+                }
+            }
+
             double intensity = 0.0;
-            const double ndotl = std::max(0.0, normal[0] * light_dir[0] + normal[1] * light_dir[1] + normal[2] * light_dir[2]);
+            const double ndotl = std::max(0.0,
+                                          normal[0] * light_vector[0] +
+                                              normal[1] * light_vector[1] +
+                                              normal[2] * light_vector[2]);
             if (specular) {
-                const double rx = 2.0 * ndotl * normal[0] - light_dir[0];
-                const double ry = 2.0 * ndotl * normal[1] - light_dir[1];
-                const double rz = 2.0 * ndotl * normal[2] - light_dir[2];
+                const double rx = 2.0 * ndotl * normal[0] - light_vector[0];
+                const double ry = 2.0 * ndotl * normal[1] - light_vector[1];
+                const double rz = 2.0 * ndotl * normal[2] - light_vector[2];
                 const auto reflection = Normalize3(rx, ry, rz);
-                intensity = specular_constant * std::pow(std::max(0.0, reflection[2]), specular_exponent);
+                intensity = specular_constant * std::pow(std::max(0.0, reflection[2]), specular_exponent) * spot_factor;
             } else {
-                intensity = diffuse_constant * ndotl;
+                intensity = diffuse_constant * ndotl * spot_factor;
             }
             intensity = std::clamp(intensity, 0.0, 1.0);
 
             const size_t base = (static_cast<size_t>(y) * output.width + static_cast<size_t>(x)) * 4;
-            const double alpha = static_cast<double>(input.rgba[base + 3]) / 255.0;
-            output.rgba[base + 0] = static_cast<uint8_t>(std::lround(std::clamp(light_color.r * intensity * alpha, 0.0, 1.0) * 255.0));
-            output.rgba[base + 1] = static_cast<uint8_t>(std::lround(std::clamp(light_color.g * intensity * alpha, 0.0, 1.0) * 255.0));
-            output.rgba[base + 2] = static_cast<uint8_t>(std::lround(std::clamp(light_color.b * intensity * alpha, 0.0, 1.0) * 255.0));
-            output.rgba[base + 3] = static_cast<uint8_t>(std::lround(alpha * 255.0));
+            output.rgba[base + 0] = static_cast<uint8_t>(std::lround(std::clamp(light_color.r * intensity, 0.0, 1.0) * 255.0));
+            output.rgba[base + 1] = static_cast<uint8_t>(std::lround(std::clamp(light_color.g * intensity, 0.0, 1.0) * 255.0));
+            output.rgba[base + 2] = static_cast<uint8_t>(std::lround(std::clamp(light_color.b * intensity, 0.0, 1.0) * 255.0));
+            output.rgba[base + 3] = 255;
+        }
+    }
+    return output;
+}
+
+PixelBounds ComputeFilterRegionBounds(const XmlNode& filter_node,
+                                      const PixelSurface& source_surface,
+                                      const GeometryEngine& geometry_engine) {
+    const PixelBounds full_bounds = FullSurfaceBounds(source_surface);
+    if (IsEmptyBounds(full_bounds)) {
+        return full_bounds;
+    }
+
+    const std::string units = Lower(Trim(filter_node.attributes.count("filterUnits")
+                                             ? filter_node.attributes.at("filterUnits")
+                                             : "objectBoundingBox"));
+
+    double x = 0.0;
+    double y = 0.0;
+    double width = static_cast<double>(source_surface.width);
+    double height = static_cast<double>(source_surface.height);
+
+    if (units == "userspaceonuse") {
+        const double viewport_width = std::max(geometry_engine.viewport_width(), 1.0);
+        const double viewport_height = std::max(geometry_engine.viewport_height(), 1.0);
+        x = ParseSVGLengthAttr(filter_node.attributes,
+                               "x",
+                               -0.1 * viewport_width,
+                               SvgLengthAxis::kX,
+                               viewport_width,
+                               viewport_height);
+        y = ParseSVGLengthAttr(filter_node.attributes,
+                               "y",
+                               -0.1 * viewport_height,
+                               SvgLengthAxis::kY,
+                               viewport_width,
+                               viewport_height);
+        width = ParseSVGLengthAttr(filter_node.attributes,
+                                   "width",
+                                   1.2 * viewport_width,
+                                   SvgLengthAxis::kX,
+                                   viewport_width,
+                                   viewport_height);
+        height = ParseSVGLengthAttr(filter_node.attributes,
+                                    "height",
+                                    1.2 * viewport_height,
+                                    SvgLengthAxis::kY,
+                                    viewport_width,
+                                    viewport_height);
+    } else {
+        const PixelBounds source_bounds = ResolveUsableBounds(source_surface, ComputeNonTransparentBounds(source_surface));
+        const double bbox_x = static_cast<double>(source_bounds.min_x);
+        const double bbox_y = static_cast<double>(source_bounds.min_y);
+        const double bbox_width = static_cast<double>(source_bounds.max_x - source_bounds.min_x + 1);
+        const double bbox_height = static_cast<double>(source_bounds.max_y - source_bounds.min_y + 1);
+        if (!(bbox_width > 0.0) || !(bbox_height > 0.0)) {
+            return full_bounds;
+        }
+
+        const auto x_it = filter_node.attributes.find("x");
+        const auto y_it = filter_node.attributes.find("y");
+        const auto width_it = filter_node.attributes.find("width");
+        const auto height_it = filter_node.attributes.find("height");
+
+        const double x_rel = x_it != filter_node.attributes.end()
+            ? ParseObjectBoundingBoxLength(x_it->second, -0.1)
+            : -0.1;
+        const double y_rel = y_it != filter_node.attributes.end()
+            ? ParseObjectBoundingBoxLength(y_it->second, -0.1)
+            : -0.1;
+        const double width_rel = width_it != filter_node.attributes.end()
+            ? ParseObjectBoundingBoxLength(width_it->second, 1.2)
+            : 1.2;
+        const double height_rel = height_it != filter_node.attributes.end()
+            ? ParseObjectBoundingBoxLength(height_it->second, 1.2)
+            : 1.2;
+
+        x = bbox_x + (x_rel * bbox_width);
+        y = bbox_y + (y_rel * bbox_height);
+        width = width_rel * bbox_width;
+        height = height_rel * bbox_height;
+    }
+
+    if (!(width > 0.0) || !(height > 0.0)) {
+        return PixelBounds{1, 1, 0, 0};
+    }
+
+    const int min_x = std::max(0, static_cast<int>(std::floor(x)));
+    const int min_y = std::max(0, static_cast<int>(std::floor(y)));
+    const int max_x = std::min(static_cast<int>(source_surface.width) - 1,
+                               static_cast<int>(std::ceil(x + width)) - 1);
+    const int max_y = std::min(static_cast<int>(source_surface.height) - 1,
+                               static_cast<int>(std::ceil(y + height)) - 1);
+    if (max_x < min_x || max_y < min_y) {
+        return PixelBounds{1, 1, 0, 0};
+    }
+    return PixelBounds{
+        static_cast<size_t>(min_x),
+        static_cast<size_t>(min_y),
+        static_cast<size_t>(max_x),
+        static_cast<size_t>(max_y),
+    };
+}
+
+PixelSurface ClipSurfaceToBounds(const PixelSurface& input, const PixelBounds& bounds) {
+    if (input.width == 0 || input.height == 0) {
+        return input;
+    }
+    if (IsEmptyBounds(bounds)) {
+        return MakeTransparentSurface(input.width, input.height);
+    }
+
+    PixelSurface output = input;
+    for (size_t y = 0; y < output.height; ++y) {
+        for (size_t x = 0; x < output.width; ++x) {
+            if (x >= bounds.min_x && x <= bounds.max_x && y >= bounds.min_y && y <= bounds.max_y) {
+                continue;
+            }
+            const size_t base = (y * output.width + x) * 4;
+            output.rgba[base + 0] = 0;
+            output.rgba[base + 1] = 0;
+            output.rgba[base + 2] = 0;
+            output.rgba[base + 3] = 0;
         }
     }
     return output;
@@ -2984,6 +3954,10 @@ std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_n
                                                          const ColorProfileMap& color_profiles,
                                                          const RenderOptions& options,
                                                          RenderError& error) {
+    if (filter_node.children.empty()) {
+        return MakeTransparentSurface(source_surface.width, source_surface.height);
+    }
+
     std::map<std::string, PixelSurface> surfaces;
     surfaces["SourceGraphic"] = source_surface;
     PixelSurface source_alpha = source_surface;
@@ -3019,15 +3993,15 @@ std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_n
             const auto stddev_values = ParseNumberList(primitive.attributes.count("stdDeviation") ? primitive.attributes.at("stdDeviation") : "");
             const double std_x = stddev_values.empty() ? 0.0 : std::max(0.0, stddev_values[0]);
             const double std_y = stddev_values.size() > 1 ? std::max(0.0, stddev_values[1]) : std_x;
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
             output = ApplyGaussianBlurFilter(*in_surface, std_x, std_y);
         } else if (primitive_name == "feoffset") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
@@ -3048,30 +4022,30 @@ std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_n
                                                 options,
                                                 error);
         } else if (primitive_name == "fecolormatrix") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
             output = ApplyColorMatrix(*in_surface, primitive);
         } else if (primitive_name == "fecomponenttransfer") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
             output = ApplyComponentTransferFilter(*in_surface, primitive);
         } else if (primitive_name == "feconvolvematrix") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
             output = ApplyConvolveMatrixFilter(*in_surface, primitive);
         } else if (primitive_name == "fecomposite") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
             const std::string in2_key = Trim(primitive.attributes.count("in2") ? primitive.attributes.at("in2") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             const auto* in2_surface = resolve_input(in2_key.empty() ? "SourceGraphic" : in2_key);
             if (in_surface == nullptr || in2_surface == nullptr) {
                 return std::nullopt;
@@ -3092,9 +4066,9 @@ std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_n
                                        parse_attr("k3", 0.0),
                                        parse_attr("k4", 0.0));
         } else if (primitive_name == "feblend") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
             const std::string in2_key = Trim(primitive.attributes.count("in2") ? primitive.attributes.at("in2") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             const auto* in2_surface = resolve_input(in2_key.empty() ? "SourceGraphic" : in2_key);
             if (in_surface == nullptr || in2_surface == nullptr) {
                 return std::nullopt;
@@ -3116,16 +4090,16 @@ std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_n
                 output = CompositeSurfaces(*merge_surface, output, "over");
             }
         } else if (primitive_name == "femorphology") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             if (in_surface == nullptr) {
                 return std::nullopt;
             }
             output = ApplyMorphologyFilter(*in_surface, primitive);
         } else if (primitive_name == "fedisplacementmap") {
-            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : last_key);
             const std::string in2_key = Trim(primitive.attributes.count("in2") ? primitive.attributes.at("in2") : "SourceGraphic");
-            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const auto* in_surface = resolve_input(in_key.empty() ? last_key : in_key);
             const auto* in2_surface = resolve_input(in2_key.empty() ? "SourceGraphic" : in2_key);
             if (in_surface == nullptr || in2_surface == nullptr) {
                 return std::nullopt;
@@ -3203,6 +4177,7 @@ CGImageRef CreateImageFromSurface(const PixelSurface& surface) {
 
 bool PaintNodeWithFilter(const XmlNode& node,
                          const std::map<std::string, std::string>& inline_style,
+                         const std::map<std::string, std::string>& matched_css_properties,
                          const ResolvedStyle& node_style,
                          const StyleResolver& style_resolver,
                          const GeometryEngine& geometry_engine,
@@ -3214,16 +4189,16 @@ bool PaintNodeWithFilter(const XmlNode& node,
                          const ColorProfileMap& color_profiles,
                          const RenderOptions& options,
                          RenderError& error) {
-    const auto filter_id = ResolveFilterID(node, inline_style);
+    const auto filter_id = ResolveFilterID(node, inline_style, &matched_css_properties);
     if (!filter_id.has_value()) {
         return false;
     }
     const auto filter_it = id_map.find(*filter_id);
     if (filter_it == id_map.end() || filter_it->second == nullptr) {
-        return false;
+        return true;
     }
     if (LocalName(filter_it->second->name) != "filter") {
-        return false;
+        return true;
     }
 
     const auto source_surface = RenderNodeToSurface(node,
@@ -3254,7 +4229,9 @@ bool PaintNodeWithFilter(const XmlNode& node,
         return false;
     }
 
-    CGImageRef filtered_image = CreateImageFromSurface(*filtered_surface);
+    const PixelBounds filter_region = ComputeFilterRegionBounds(*filter_it->second, *source_surface, geometry_engine);
+    const PixelSurface clipped_surface = ClipSurfaceToBounds(*filtered_surface, filter_region);
+    CGImageRef filtered_image = CreateImageFromSurface(clipped_surface);
     if (filtered_image == nullptr) {
         return false;
     }
@@ -3619,7 +4596,22 @@ bool AddGeometryPath(CGContextRef context, const ShapeGeometry& geometry) {
     }
 }
 
-std::string ResolveTextFontFamily(const std::string& font_family) {
+std::string ResolveGenericFontFamily(const std::string& family) {
+    const std::string normalized = Lower(Trim(family));
+    if (normalized == "sans-serif") {
+        return "Helvetica";
+    }
+    if (normalized == "serif") {
+        return "Times New Roman";
+    }
+    if (normalized == "monospace") {
+        return "Courier";
+    }
+    return Trim(family);
+}
+
+std::vector<std::string> ResolveTextFontFamilies(const std::string& font_family) {
+    std::vector<std::string> families;
     std::stringstream stream(font_family);
     std::string candidate;
     while (std::getline(stream, candidate, ',')) {
@@ -3627,110 +4619,808 @@ std::string ResolveTextFontFamily(const std::string& font_family) {
         if (candidate.size() >= 2 &&
             ((candidate.front() == '"' && candidate.back() == '"') ||
              (candidate.front() == '\'' && candidate.back() == '\''))) {
-            candidate = candidate.substr(1, candidate.size() - 2);
-            candidate = Trim(candidate);
+            candidate = Trim(candidate.substr(1, candidate.size() - 2));
         }
+        candidate = ResolveGenericFontFamily(candidate);
         if (!candidate.empty()) {
-            const std::string normalized = Lower(candidate);
-            if (normalized == "sans-serif") {
-                return "Helvetica";
-            }
-            if (normalized == "serif") {
-                return "Times New Roman";
-            }
-            if (normalized == "monospace") {
-                return "Courier";
-            }
-            return candidate;
+            families.push_back(candidate);
         }
     }
-    return "Helvetica";
+    if (families.empty()) {
+        families.push_back("Helvetica");
+    }
+    return families;
 }
 
-void DrawText(CGContextRef context, const ShapeGeometry& geometry, const ResolvedStyle& style) {
-    if (geometry.text.empty()) {
+bool FontFamilyExists(const std::string& family_name) {
+    static const std::set<std::string> available_families = []() {
+        std::set<std::string> names;
+        CFArrayRef families = CTFontManagerCopyAvailableFontFamilyNames();
+        if (families != nullptr) {
+            const CFIndex count = CFArrayGetCount(families);
+            for (CFIndex i = 0; i < count; ++i) {
+                const auto* item = static_cast<CFStringRef>(CFArrayGetValueAtIndex(families, i));
+                if (item == nullptr) {
+                    continue;
+                }
+                char buffer[256];
+                if (CFStringGetCString(item, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+                    names.insert(Lower(Trim(buffer)));
+                }
+            }
+            CFRelease(families);
+        }
+        return names;
+    }();
+
+    return available_families.find(Lower(Trim(family_name))) != available_families.end();
+}
+
+struct TextRun {
+    std::string text;
+    double x = 0.0;
+    double y = 0.0;
+    double dx = 0.0;
+    double dy = 0.0;
+    bool has_x = false;
+    bool has_y = false;
+    ResolvedStyle style;
+};
+
+struct PathSegment {
+    CGPoint start = CGPointZero;
+    CGPoint end = CGPointZero;
+    double length = 0.0;
+};
+
+struct FlattenPathContext {
+    std::vector<PathSegment> segments;
+    CGPoint current = CGPointZero;
+    CGPoint subpath_start = CGPointZero;
+    bool has_current = false;
+};
+
+CGPoint EvaluateQuadraticBezier(CGPoint p0, CGPoint p1, CGPoint p2, double t) {
+    const double one_minus_t = 1.0 - t;
+    const double x = (one_minus_t * one_minus_t * p0.x) +
+        (2.0 * one_minus_t * t * p1.x) +
+        (t * t * p2.x);
+    const double y = (one_minus_t * one_minus_t * p0.y) +
+        (2.0 * one_minus_t * t * p1.y) +
+        (t * t * p2.y);
+    return CGPointMake(static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+}
+
+CGPoint EvaluateCubicBezier(CGPoint p0, CGPoint p1, CGPoint p2, CGPoint p3, double t) {
+    const double one_minus_t = 1.0 - t;
+    const double x = (one_minus_t * one_minus_t * one_minus_t * p0.x) +
+        (3.0 * one_minus_t * one_minus_t * t * p1.x) +
+        (3.0 * one_minus_t * t * t * p2.x) +
+        (t * t * t * p3.x);
+    const double y = (one_minus_t * one_minus_t * one_minus_t * p0.y) +
+        (3.0 * one_minus_t * one_minus_t * t * p1.y) +
+        (3.0 * one_minus_t * t * t * p2.y) +
+        (t * t * t * p3.y);
+    return CGPointMake(static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+}
+
+void AppendPathSegment(FlattenPathContext* context, CGPoint start, CGPoint end) {
+    if (context == nullptr) {
+        return;
+    }
+    const double dx = static_cast<double>(end.x - start.x);
+    const double dy = static_cast<double>(end.y - start.y);
+    const double length = std::sqrt((dx * dx) + (dy * dy));
+    if (length <= 1e-9) {
+        return;
+    }
+    PathSegment segment;
+    segment.start = start;
+    segment.end = end;
+    segment.length = length;
+    context->segments.push_back(segment);
+}
+
+void FlattenPathCallback(void* info, const CGPathElement* element) {
+    auto* context = static_cast<FlattenPathContext*>(info);
+    if (context == nullptr || element == nullptr) {
         return;
     }
 
-    CFStringRef text = CFStringCreateWithCString(kCFAllocatorDefault, geometry.text.c_str(), kCFStringEncodingUTF8);
-    const std::string resolved_font_family = ResolveTextFontFamily(style.font_family);
-    CFStringRef font_name = CFStringCreateWithCString(kCFAllocatorDefault,
-                                                      resolved_font_family.c_str(),
-                                                      kCFStringEncodingUTF8);
+    switch (element->type) {
+        case kCGPathElementMoveToPoint:
+            context->current = element->points[0];
+            context->subpath_start = context->current;
+            context->has_current = true;
+            break;
+        case kCGPathElementAddLineToPoint:
+            if (!context->has_current) {
+                break;
+            }
+            AppendPathSegment(context, context->current, element->points[0]);
+            context->current = element->points[0];
+            break;
+        case kCGPathElementAddQuadCurveToPoint:
+            if (!context->has_current) {
+                break;
+            }
+            {
+                CGPoint last = context->current;
+                constexpr int kSteps = 24;
+                for (int step = 1; step <= kSteps; ++step) {
+                    const double t = static_cast<double>(step) / static_cast<double>(kSteps);
+                    const CGPoint point = EvaluateQuadraticBezier(context->current,
+                                                                  element->points[0],
+                                                                  element->points[1],
+                                                                  t);
+                    AppendPathSegment(context, last, point);
+                    last = point;
+                }
+                context->current = element->points[1];
+            }
+            break;
+        case kCGPathElementAddCurveToPoint:
+            if (!context->has_current) {
+                break;
+            }
+            {
+                CGPoint last = context->current;
+                constexpr int kSteps = 32;
+                for (int step = 1; step <= kSteps; ++step) {
+                    const double t = static_cast<double>(step) / static_cast<double>(kSteps);
+                    const CGPoint point = EvaluateCubicBezier(context->current,
+                                                              element->points[0],
+                                                              element->points[1],
+                                                              element->points[2],
+                                                              t);
+                    AppendPathSegment(context, last, point);
+                    last = point;
+                }
+                context->current = element->points[2];
+            }
+            break;
+        case kCGPathElementCloseSubpath:
+            if (!context->has_current) {
+                break;
+            }
+            AppendPathSegment(context, context->current, context->subpath_start);
+            context->current = context->subpath_start;
+            break;
+    }
+}
 
-    const CGFloat font_size = style.font_size > 0.0f ? style.font_size : 16.0f;
-    CTFontRef font = CTFontCreateWithName(font_name, font_size, nullptr);
-    CTFontRef draw_font = font;
-    if (style.font_weight >= 600) {
-        if (CTFontRef bold_font = CTFontCreateCopyWithSymbolicTraits(font,
-                                                                      font_size,
-                                                                      nullptr,
-                                                                      kCTFontBoldTrait,
-                                                                      kCTFontBoldTrait)) {
-            draw_font = bold_font;
+std::vector<PathSegment> FlattenPathSegments(CGPathRef path) {
+    if (path == nullptr) {
+        return {};
+    }
+    FlattenPathContext context;
+    CGPathApply(path, &context, FlattenPathCallback);
+    return context.segments;
+}
+
+double PathLength(const std::vector<PathSegment>& segments) {
+    double length = 0.0;
+    for (const auto& segment : segments) {
+        length += segment.length;
+    }
+    return length;
+}
+
+bool PointAndTangentAtDistance(const std::vector<PathSegment>& segments,
+                               double distance,
+                               CGPoint& point,
+                               CGPoint& tangent) {
+    if (segments.empty()) {
+        return false;
+    }
+
+    const double total_length = PathLength(segments);
+    if (!(total_length > 0.0)) {
+        return false;
+    }
+
+    const double target = std::clamp(distance, 0.0, total_length);
+    double traversed = 0.0;
+    for (const auto& segment : segments) {
+        if (!(segment.length > 0.0)) {
+            continue;
         }
+        if (target <= traversed + segment.length) {
+            const double t = (target - traversed) / segment.length;
+            const double px = static_cast<double>(segment.start.x) +
+                (static_cast<double>(segment.end.x - segment.start.x) * t);
+            const double py = static_cast<double>(segment.start.y) +
+                (static_cast<double>(segment.end.y - segment.start.y) * t);
+            point = CGPointMake(static_cast<CGFloat>(px), static_cast<CGFloat>(py));
+
+            const double dx = static_cast<double>(segment.end.x - segment.start.x);
+            const double dy = static_cast<double>(segment.end.y - segment.start.y);
+            const double inv_length = 1.0 / segment.length;
+            tangent = CGPointMake(static_cast<CGFloat>(dx * inv_length), static_cast<CGFloat>(dy * inv_length));
+            return true;
+        }
+        traversed += segment.length;
+    }
+
+    const auto& tail = segments.back();
+    point = tail.end;
+    const double dx = static_cast<double>(tail.end.x - tail.start.x);
+    const double dy = static_cast<double>(tail.end.y - tail.start.y);
+    const double length = std::sqrt((dx * dx) + (dy * dy));
+    if (!(length > 1e-9)) {
+        tangent = CGPointMake(1.0, 0.0);
+        return true;
+    }
+    tangent = CGPointMake(static_cast<CGFloat>(dx / length), static_cast<CGFloat>(dy / length));
+    return true;
+}
+
+std::vector<std::string> SplitUTF8Codepoints(const std::string& text) {
+    std::vector<std::string> codepoints;
+    size_t index = 0;
+    while (index < text.size()) {
+        const unsigned char lead = static_cast<unsigned char>(text[index]);
+        size_t length = 1;
+        if ((lead & 0x80u) == 0x00u) {
+            length = 1;
+        } else if ((lead & 0xE0u) == 0xC0u) {
+            length = 2;
+        } else if ((lead & 0xF0u) == 0xE0u) {
+            length = 3;
+        } else if ((lead & 0xF8u) == 0xF0u) {
+            length = 4;
+        }
+
+        if (index + length > text.size()) {
+            length = 1;
+        }
+        codepoints.push_back(text.substr(index, length));
+        index += length;
+    }
+    return codepoints;
+}
+
+CGPathRef CopyPathForTextPathNode(const XmlNode& text_path_node,
+                                  const GeometryEngine& geometry_engine,
+                                  const NodeIdMap& id_map) {
+    const auto href = ExtractHrefValue(text_path_node);
+    if (!href.has_value() || href->empty() || href->front() != '#') {
+        return nullptr;
+    }
+    const auto target_it = id_map.find(href->substr(1));
+    if (target_it == id_map.end() || target_it->second == nullptr) {
+        return nullptr;
+    }
+
+    const auto geometry = geometry_engine.Build(*target_it->second);
+    if (!geometry.has_value()) {
+        return nullptr;
+    }
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef temp_context = CGBitmapContextCreate(nullptr,
+                                                      1,
+                                                      1,
+                                                      8,
+                                                      0,
+                                                      color_space,
+                                                      static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    CGColorSpaceRelease(color_space);
+    if (temp_context == nullptr) {
+        return nullptr;
+    }
+
+    CGContextBeginPath(temp_context);
+    if (!AddGeometryPath(temp_context, *geometry)) {
+        CGContextRelease(temp_context);
+        return nullptr;
+    }
+    CGPathRef path = CGContextCopyPath(temp_context);
+    CGContextRelease(temp_context);
+    return path;
+}
+
+double ParseTextPathStartOffset(const XmlNode& text_path_node,
+                                double path_length,
+                                const GeometryEngine& geometry_engine) {
+    const auto start_offset_it = text_path_node.attributes.find("startOffset");
+    if (start_offset_it == text_path_node.attributes.end()) {
+        return 0.0;
+    }
+
+    const std::string raw = Trim(start_offset_it->second);
+    if (raw.empty()) {
+        return 0.0;
+    }
+    if (!raw.empty() && raw.back() == '%') {
+        return ParseDouble(raw, 0.0) * 0.01 * path_length;
+    }
+
+    return ParseSVGLength(raw,
+                          0.0,
+                          SvgLengthAxis::kX,
+                          std::max(geometry_engine.viewport_width(), 1.0),
+                          std::max(geometry_engine.viewport_height(), 1.0));
+}
+
+std::string FirstLengthComponent(const std::string& raw) {
+    std::string normalized = raw;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::stringstream stream(normalized);
+    std::string token;
+    stream >> token;
+    return token;
+}
+
+double ParseTextLengthAttr(const XmlNode& node,
+                           const char* key,
+                           double fallback,
+                           SvgLengthAxis axis,
+                           const GeometryEngine& geometry_engine) {
+    const auto it = node.attributes.find(key);
+    if (it == node.attributes.end()) {
+        return fallback;
+    }
+    const double viewport_width = std::max(geometry_engine.viewport_width(), 1.0);
+    const double viewport_height = std::max(geometry_engine.viewport_height(), 1.0);
+    const std::string token = FirstLengthComponent(it->second);
+    return ParseSVGLength(token.empty() ? it->second : token,
+                          fallback,
+                          axis,
+                          viewport_width,
+                          viewport_height);
+}
+
+std::string ResolveTextReference(const XmlNode& tref_node, const NodeIdMap& id_map) {
+    const auto href = ExtractHrefValue(tref_node);
+    if (!href.has_value() || href->empty() || href->front() != '#') {
+        return {};
+    }
+    const auto target_it = id_map.find(href->substr(1));
+    if (target_it == id_map.end() || target_it->second == nullptr) {
+        return {};
+    }
+    return target_it->second->text;
+}
+
+void CollectTextRuns(const XmlNode& node,
+                     const ResolvedStyle& inherited_style,
+                     const StyleResolver& style_resolver,
+                     const GeometryEngine& geometry_engine,
+                     const NodeIdMap& id_map,
+                     const RenderOptions& options,
+                     std::vector<TextRun>& runs,
+                     bool include_node_text) {
+    if (include_node_text && !node.text.empty()) {
+        TextRun run;
+        run.text = node.text;
+        run.style = inherited_style;
+        runs.push_back(std::move(run));
+    }
+
+    for (const auto& child : node.children) {
+        const auto local_name = LocalName(child.name);
+        if (local_name != "tspan" && local_name != "tref") {
+            continue;
+        }
+
+        const ResolvedStyle child_style = style_resolver.Resolve(child, &inherited_style, options);
+        TextRun run;
+        run.style = child_style;
+        run.text = (local_name == "tref") ? ResolveTextReference(child, id_map) : child.text;
+
+        if (child.attributes.find("x") != child.attributes.end()) {
+            run.has_x = true;
+            run.x = ParseTextLengthAttr(child, "x", 0.0, SvgLengthAxis::kX, geometry_engine);
+        }
+        if (child.attributes.find("y") != child.attributes.end()) {
+            run.has_y = true;
+            run.y = ParseTextLengthAttr(child, "y", 0.0, SvgLengthAxis::kY, geometry_engine);
+        }
+        run.dx = ParseTextLengthAttr(child, "dx", 0.0, SvgLengthAxis::kX, geometry_engine);
+        run.dy = ParseTextLengthAttr(child, "dy", 0.0, SvgLengthAxis::kY, geometry_engine);
+
+        if (!run.text.empty()) {
+            runs.push_back(std::move(run));
+        }
+        CollectTextRuns(child,
+                        child_style,
+                        style_resolver,
+                        geometry_engine,
+                        id_map,
+                        options,
+                        runs,
+                        false);
+    }
+}
+
+CTFontRef CreateTextFontForStyle(const ResolvedStyle& style) {
+    const std::string resolved_family = ResolveTextFontFamily(style.font_family);
+    const CGFloat font_size = style.font_size > 0.0f ? style.font_size : 16.0f;
+
+    CFStringRef family_name = CFStringCreateWithCString(kCFAllocatorDefault,
+                                                         resolved_family.c_str(),
+                                                         kCFStringEncodingUTF8);
+    CTFontRef font = nullptr;
+
+    const void* keys[] = {kCTFontFamilyNameAttribute};
+    const void* values[] = {family_name};
+    CFDictionaryRef descriptor_attrs = CFDictionaryCreate(kCFAllocatorDefault,
+                                                          keys,
+                                                          values,
+                                                          1,
+                                                          &kCFTypeDictionaryKeyCallBacks,
+                                                          &kCFTypeDictionaryValueCallBacks);
+    if (descriptor_attrs != nullptr) {
+        CTFontDescriptorRef descriptor = CTFontDescriptorCreateWithAttributes(descriptor_attrs);
+        if (descriptor != nullptr) {
+            font = CTFontCreateWithFontDescriptor(descriptor, font_size, nullptr);
+            CFRelease(descriptor);
+        }
+        CFRelease(descriptor_attrs);
+    }
+
+    if (font == nullptr) {
+        font = CTFontCreateWithName(family_name, font_size, nullptr);
+    }
+
+    CTFontSymbolicTraits desired_traits = 0;
+    if (style.font_weight >= 600) {
+        desired_traits |= kCTFontBoldTrait;
+    }
+    if (style.font_style == "italic" || style.font_style == "oblique") {
+        desired_traits |= kCTFontItalicTrait;
+    }
+    if (desired_traits != 0) {
+        if (CTFontRef trait_font = CTFontCreateCopyWithSymbolicTraits(font,
+                                                                       font_size,
+                                                                       nullptr,
+                                                                       desired_traits,
+                                                                       kCTFontBoldTrait | kCTFontItalicTrait)) {
+            CFRelease(font);
+            font = trait_font;
+        }
+    }
+
+    CFRelease(family_name);
+    return font;
+}
+
+double CountSpaces(const std::string& text) {
+    return static_cast<double>(std::count(text.begin(), text.end(), ' '));
+}
+
+double MeasureTextRunWidth(const TextRun& run) {
+    if (run.text.empty()) {
+        return 0.0;
+    }
+
+    CTFontRef font = CreateTextFontForStyle(run.style);
+    if (font == nullptr) {
+        return 0.0;
+    }
+
+    CFStringRef text = CFStringCreateWithCString(kCFAllocatorDefault, run.text.c_str(), kCFStringEncodingUTF8);
+    if (text == nullptr) {
+        CFRelease(font);
+        return 0.0;
+    }
+
+    CGFloat fill_components[] = {0.0, 0.0, 0.0, 1.0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGColorRef color = CGColorCreate(cs, fill_components);
+    CFNumberRef kern = nullptr;
+    const CGFloat kern_value = run.style.letter_spacing;
+    if (std::abs(kern_value) > 0.0001) {
+        kern = CFNumberCreate(kCFAllocatorDefault, kCFNumberCGFloatType, &kern_value);
+    }
+
+    std::array<CFTypeRef, 3> keys = {kCTFontAttributeName, kCTForegroundColorAttributeName, kCTKernAttributeName};
+    std::array<CFTypeRef, 3> values = {font, color, kern};
+    CFIndex count = kern != nullptr ? 3 : 2;
+    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
+                                               reinterpret_cast<const void**>(keys.data()),
+                                               reinterpret_cast<const void**>(values.data()),
+                                               count,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+
+    CFAttributedStringRef attr_string = CFAttributedStringCreate(kCFAllocatorDefault, text, attrs);
+    CTLineRef line = CTLineCreateWithAttributedString(attr_string);
+    double width = CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr);
+    if (!std::isfinite(width)) {
+        width = 0.0;
+    }
+    width += run.style.word_spacing * CountSpaces(run.text);
+
+    CFRelease(line);
+    CFRelease(attr_string);
+    CFRelease(attrs);
+    if (kern != nullptr) {
+        CFRelease(kern);
+    }
+    CGColorRelease(color);
+    CGColorSpaceRelease(cs);
+    CFRelease(text);
+    CFRelease(font);
+    return width;
+}
+
+double DrawTextRun(CGContextRef context, const TextRun& run, double x, double y) {
+    if (run.text.empty()) {
+        return 0.0;
+    }
+
+    CTFontRef font = CreateTextFontForStyle(run.style);
+    if (font == nullptr) {
+        return 0.0;
+    }
+
+    CFStringRef text = CFStringCreateWithCString(kCFAllocatorDefault, run.text.c_str(), kCFStringEncodingUTF8);
+    if (text == nullptr) {
+        CFRelease(font);
+        return 0.0;
     }
 
     CGFloat fill_r = 0.0;
     CGFloat fill_g = 0.0;
     CGFloat fill_b = 0.0;
     CGFloat fill_a = 1.0;
-    if (style.fill.is_valid && !style.fill.is_none) {
-        fill_r = style.fill.r;
-        fill_g = style.fill.g;
-        fill_b = style.fill.b;
-        fill_a = std::clamp(style.fill.a * style.opacity * style.fill_opacity, 0.0f, 1.0f);
+    if (run.style.fill.is_valid && !run.style.fill.is_none) {
+        fill_r = run.style.fill.r;
+        fill_g = run.style.fill.g;
+        fill_b = run.style.fill.b;
+        fill_a = std::clamp(run.style.fill.a * run.style.opacity * run.style.fill_opacity, 0.0f, 1.0f);
     }
 
     const CGFloat components[] = {fill_r, fill_g, fill_b, fill_a};
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGColorRef cg_color = CGColorCreate(cs, components);
+    CGColorRef color = CGColorCreate(cs, components);
 
-    CFTypeRef keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-    CFTypeRef values[] = {draw_font, cg_color};
+    CFNumberRef kern = nullptr;
+    const CGFloat kern_value = run.style.letter_spacing;
+    if (std::abs(kern_value) > 0.0001) {
+        kern = CFNumberCreate(kCFAllocatorDefault, kCFNumberCGFloatType, &kern_value);
+    }
+
+    std::array<CFTypeRef, 3> keys = {kCTFontAttributeName, kCTForegroundColorAttributeName, kCTKernAttributeName};
+    std::array<CFTypeRef, 3> values = {font, color, kern};
+    CFIndex count = kern != nullptr ? 3 : 2;
     CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
-                                               reinterpret_cast<const void**>(keys),
-                                               reinterpret_cast<const void**>(values),
-                                               2,
+                                               reinterpret_cast<const void**>(keys.data()),
+                                               reinterpret_cast<const void**>(values.data()),
+                                               count,
                                                &kCFTypeDictionaryKeyCallBacks,
                                                &kCFTypeDictionaryValueCallBacks);
 
     CFAttributedStringRef attr_string = CFAttributedStringCreate(kCFAllocatorDefault, text, attrs);
     CTLineRef line = CTLineCreateWithAttributedString(attr_string);
-    const auto anchor = Lower(Trim(style.text_anchor));
-    double line_width = CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr);
+    CGFloat ascent = 0.0;
+    CGFloat descent = 0.0;
+    double line_width = CTLineGetTypographicBounds(line, &ascent, &descent, nullptr);
     if (!std::isfinite(line_width)) {
         line_width = 0.0;
     }
-    CGFloat anchor_offset = 0.0;
-    if (anchor == "middle") {
-        anchor_offset = static_cast<CGFloat>(-line_width * 0.5);
-    } else if (anchor == "end") {
-        anchor_offset = static_cast<CGFloat>(-line_width);
-    }
+    line_width += run.style.word_spacing * CountSpaces(run.text);
 
     CGContextSaveGState(context);
     // CoreText glyphs are defined in a Y-up text space. Since the renderer
     // flips the global CTM to SVG's Y-down coordinates, unflip locally for
     // text so glyphs are not mirrored/inverted.
-    CGContextTranslateCTM(context, static_cast<CGFloat>(geometry.x), static_cast<CGFloat>(geometry.y));
+    CGContextTranslateCTM(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
     CGContextScaleCTM(context, 1.0, -1.0);
     CGContextSetTextMatrix(context, CGAffineTransformIdentity);
-    CGContextSetTextPosition(context, anchor_offset, 0.0);
+    CGContextSetTextPosition(context, 0.0, 0.0);
     CTLineDraw(line, context);
+
+    const std::string text_decoration = Lower(Trim(run.style.text_decoration));
+    if (text_decoration != "none") {
+        CGContextSetStrokeColorWithColor(context, color);
+        const CGFloat underline_thickness = std::max(CTFontGetUnderlineThickness(font), 1.0);
+        CGContextSetLineWidth(context, underline_thickness);
+
+        if (text_decoration.find("underline") != std::string::npos) {
+            const CGFloat underline_y = CTFontGetUnderlinePosition(font);
+            CGContextMoveToPoint(context, 0.0, underline_y);
+            CGContextAddLineToPoint(context, static_cast<CGFloat>(line_width), underline_y);
+            CGContextStrokePath(context);
+        }
+        if (text_decoration.find("line-through") != std::string::npos) {
+            const CGFloat strike_y = ascent * 0.35f;
+            CGContextMoveToPoint(context, 0.0, strike_y);
+            CGContextAddLineToPoint(context, static_cast<CGFloat>(line_width), strike_y);
+            CGContextStrokePath(context);
+        }
+    }
     CGContextRestoreGState(context);
 
     CFRelease(line);
     CFRelease(attr_string);
     CFRelease(attrs);
-    CGColorRelease(cg_color);
-    CGColorSpaceRelease(cs);
-    if (draw_font != font) {
-        CFRelease(draw_font);
+    if (kern != nullptr) {
+        CFRelease(kern);
     }
-    CFRelease(font);
-    CFRelease(font_name);
+    CGColorRelease(color);
+    CGColorSpaceRelease(cs);
     CFRelease(text);
+    CFRelease(font);
+    return line_width;
+}
+
+void DrawTextAlongPath(CGContextRef context,
+                       const XmlNode& text_node,
+                       const ResolvedStyle& style,
+                       const StyleResolver& style_resolver,
+                       const GeometryEngine& geometry_engine,
+                       const NodeIdMap& id_map,
+                       const RenderOptions& options) {
+    const XmlNode* text_path_node = nullptr;
+    for (const auto& child : text_node.children) {
+        if (LocalName(child.name) == "textpath") {
+            text_path_node = &child;
+            break;
+        }
+    }
+    if (text_path_node == nullptr) {
+        return;
+    }
+
+    CGPathRef path = CopyPathForTextPathNode(*text_path_node, geometry_engine, id_map);
+    if (path == nullptr) {
+        return;
+    }
+    const auto segments = FlattenPathSegments(path);
+    CGPathRelease(path);
+    const double total_length = PathLength(segments);
+    if (!(total_length > 0.0)) {
+        return;
+    }
+
+    const ResolvedStyle path_style = style_resolver.Resolve(*text_path_node, &style, options);
+    std::vector<TextRun> runs;
+    runs.reserve(16);
+    CollectTextRuns(*text_path_node, path_style, style_resolver, geometry_engine, id_map, options, runs, true);
+    if (runs.empty()) {
+        return;
+    }
+
+    double pen = ParseTextPathStartOffset(*text_path_node, total_length, geometry_engine);
+    double baseline_shift = 0.0;
+    for (const auto& run : runs) {
+        if (run.has_x) {
+            pen = run.x;
+        }
+        if (run.has_y) {
+            baseline_shift = run.y;
+        }
+        pen += run.dx;
+        baseline_shift += run.dy;
+
+        for (const auto& glyph : SplitUTF8Codepoints(run.text)) {
+            if (glyph.empty()) {
+                continue;
+            }
+            TextRun glyph_run = run;
+            glyph_run.text = glyph;
+            glyph_run.dx = 0.0;
+            glyph_run.dy = 0.0;
+            glyph_run.has_x = false;
+            glyph_run.has_y = false;
+            const double advance = MeasureTextRunWidth(glyph_run);
+            if (!(advance > 0.0)) {
+                continue;
+            }
+
+            CGPoint point = CGPointZero;
+            CGPoint tangent = CGPointMake(1.0, 0.0);
+            if (PointAndTangentAtDistance(segments, pen + advance * 0.5, point, tangent)) {
+                const double angle = std::atan2(static_cast<double>(tangent.y), static_cast<double>(tangent.x));
+                const double normal_x = -static_cast<double>(tangent.y);
+                const double normal_y = static_cast<double>(tangent.x);
+                CGContextSaveGState(context);
+                CGContextTranslateCTM(context,
+                                      static_cast<CGFloat>(static_cast<double>(point.x) + normal_x * baseline_shift),
+                                      static_cast<CGFloat>(static_cast<double>(point.y) + normal_y * baseline_shift));
+                CGContextRotateCTM(context, static_cast<CGFloat>(angle));
+                DrawTextRun(context, glyph_run, -advance * 0.5, 0.0);
+                CGContextRestoreGState(context);
+            }
+
+            pen += advance;
+            if (pen > total_length + advance) {
+                return;
+            }
+        }
+    }
+}
+
+void DrawText(CGContextRef context, const ShapeGeometry& geometry, const ResolvedStyle& style) {
+    if (geometry.text.empty()) {
+        return;
+    }
+    TextRun run;
+    run.text = geometry.text;
+    run.style = style;
+
+    double anchor_offset = 0.0;
+    const auto anchor = Lower(Trim(style.text_anchor));
+    const double width = MeasureTextRunWidth(run);
+    if (anchor == "middle") {
+        anchor_offset = -width * 0.5;
+    } else if (anchor == "end") {
+        anchor_offset = -width;
+    }
+    DrawTextRun(context, run, geometry.x + anchor_offset, geometry.y);
+}
+
+void DrawText(CGContextRef context,
+              const XmlNode& node,
+              const ShapeGeometry& geometry,
+              const ResolvedStyle& style,
+              const StyleResolver& style_resolver,
+              const GeometryEngine& geometry_engine,
+              const NodeIdMap& id_map,
+              const RenderOptions& options) {
+    const bool has_text_path = std::any_of(node.children.begin(),
+                                           node.children.end(),
+                                           [](const XmlNode& child) {
+                                               return LocalName(child.name) == "textpath";
+                                           });
+    if (has_text_path) {
+        DrawTextAlongPath(context, node, style, style_resolver, geometry_engine, id_map, options);
+        return;
+    }
+
+    std::vector<TextRun> runs;
+    runs.reserve(8);
+
+    if (!geometry.text.empty()) {
+        TextRun root_run;
+        root_run.text = geometry.text;
+        root_run.style = style;
+        runs.push_back(std::move(root_run));
+    }
+    CollectTextRuns(node, style, style_resolver, geometry_engine, id_map, options, runs, false);
+    if (runs.empty()) {
+        return;
+    }
+
+    const bool has_absolute_positioned_runs = std::any_of(runs.begin(),
+                                                          runs.end(),
+                                                          [](const TextRun& run) { return run.has_x || run.has_y; });
+
+    double anchor_offset = 0.0;
+    if (!has_absolute_positioned_runs) {
+        double total_width = 0.0;
+        for (const auto& run : runs) {
+            total_width += MeasureTextRunWidth(run);
+        }
+        const auto anchor = Lower(Trim(style.text_anchor));
+        if (anchor == "middle") {
+            anchor_offset = -total_width * 0.5;
+        } else if (anchor == "end") {
+            anchor_offset = -total_width;
+        }
+    }
+
+    double pen_x = geometry.x;
+    double pen_y = geometry.y;
+    bool anchor_applied = false;
+    for (const auto& run : runs) {
+        if (run.has_x) {
+            pen_x = run.x;
+            anchor_applied = false;
+        }
+        if (run.has_y) {
+            pen_y = run.y;
+        }
+        pen_x += run.dx;
+        pen_y += run.dy;
+
+        const double run_anchor_offset = (!anchor_applied && !has_absolute_positioned_runs) ? anchor_offset : 0.0;
+        const double advance = DrawTextRun(context, run, pen_x + run_anchor_offset, pen_y);
+        pen_x += advance;
+        anchor_applied = true;
+    }
 }
 
 std::string LocalName(const std::string& name) {
@@ -3887,18 +5577,19 @@ void PaintNode(const XmlNode& node,
                RenderError& error,
                bool apply_filters,
                bool suppress_current_opacity) {
-    auto style = style_resolver.Resolve(node, parent_style, options);
+    const auto matched_css_properties = ResolveMatchedCssProperties(node);
+    auto style = style_resolver.Resolve(node, parent_style, options, &matched_css_properties);
     if (suppress_current_opacity) {
         style.opacity = 1.0f;
     }
     const auto style_it = node.attributes.find("style");
     const auto inline_style = style_it != node.attributes.end() ? ParseInlineStyle(style_it->second) : std::map<std::string, std::string>{};
 
-    if (const auto display = ReadAttrOrStyle(node, inline_style, "display");
+    if (const auto display = ReadAttrOrStyle(node, inline_style, &matched_css_properties, "display");
         display.has_value() && Lower(Trim(*display)) == "none") {
         return;
     }
-    if (const auto visibility = ReadAttrOrStyle(node, inline_style, "visibility"); visibility.has_value()) {
+    if (const auto visibility = ReadAttrOrStyle(node, inline_style, &matched_css_properties, "visibility"); visibility.has_value()) {
         const auto visibility_value = Lower(Trim(*visibility));
         if (visibility_value == "hidden" || visibility_value == "collapse") {
             return;
@@ -3933,6 +5624,7 @@ void PaintNode(const XmlNode& node,
     if (apply_filters &&
         PaintNodeWithFilter(node,
                             inline_style,
+                            matched_css_properties,
                             style,
                             style_resolver,
                             geometry_engine,
@@ -4188,7 +5880,14 @@ void PaintNode(const XmlNode& node,
 
     switch (geometry->type) {
         case ShapeType::kText:
-            DrawText(context, *geometry, style);
+            DrawText(context,
+                     node,
+                     *geometry,
+                     style,
+                     style_resolver,
+                     geometry_engine,
+                     id_map,
+                     options);
             break;
         case ShapeType::kImage: {
             if (geometry->width > 0.0 && geometry->height > 0.0 && !geometry->href.empty()) {
@@ -4197,7 +5896,7 @@ void PaintNode(const XmlNode& node,
                     CGImageRef image_to_draw = image;
                     CGImageRef transformed = nullptr;
 
-                    if (const auto color_profile_value = ReadAttrOrStyle(node, inline_style, "color-profile");
+                    if (const auto color_profile_value = ReadAttrOrStyle(node, inline_style, &matched_css_properties, "color-profile");
                         color_profile_value.has_value()) {
                         if (const auto profile_ref = ExtractColorProfileReference(*color_profile_value); profile_ref.has_value()) {
                             auto profile_it = color_profiles.find(*profile_ref);
@@ -4391,6 +6090,9 @@ bool PaintEngine::Paint(const SvgDocument& document,
     CollectNodesByID(document.root, id_map);
     ColorProfileMap color_profiles;
     CollectColorProfiles(document.root, color_profiles);
+    const CssStylesheet stylesheet = BuildCssStylesheet(document.root);
+    const CssStylesheet* previous_stylesheet = g_active_stylesheet;
+    g_active_stylesheet = &stylesheet;
     std::set<std::string> active_use_ids;
     std::set<std::string> active_pattern_ids;
 
@@ -4426,6 +6128,7 @@ bool PaintEngine::Paint(const SvgDocument& document,
               options,
               error);
     CGContextRestoreGState(context);
+    g_active_stylesheet = previous_stylesheet;
     return error.code == RenderErrorCode::kNone;
 }
 

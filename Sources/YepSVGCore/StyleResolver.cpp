@@ -341,6 +341,105 @@ int ParseFontWeight(const std::string& value, int fallback) {
     return static_cast<int>(std::clamp(*numeric, 1.0f, 1000.0f));
 }
 
+std::vector<std::string> SplitWhitespacePreservingQuotes(const std::string& value) {
+    std::vector<std::string> tokens;
+    std::string current;
+    char quote = '\0';
+    for (char c : value) {
+        if (quote != '\0') {
+            current.push_back(c);
+            if (c == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            quote = c;
+            current.push_back(c);
+            continue;
+        }
+        if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+            if (!current.empty()) {
+                tokens.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) {
+        tokens.push_back(current);
+    }
+    return tokens;
+}
+
+struct FontShorthand {
+    bool has_size = false;
+    float size = 0.0f;
+    std::string family;
+    std::optional<std::string> style;
+    std::optional<int> weight;
+};
+
+std::optional<FontShorthand> ParseFontShorthand(const std::string& value, float inherited_size) {
+    const std::string trimmed = Trim(value);
+    if (trimmed.empty()) {
+        return std::nullopt;
+    }
+
+    const auto tokens = SplitWhitespacePreservingQuotes(trimmed);
+    if (tokens.empty()) {
+        return std::nullopt;
+    }
+
+    FontShorthand shorthand;
+    size_t size_index = tokens.size();
+    std::string size_token;
+    for (size_t index = 0; index < tokens.size(); ++index) {
+        std::string candidate = tokens[index];
+        const auto slash = candidate.find('/');
+        if (slash != std::string::npos) {
+            candidate = candidate.substr(0, slash);
+        }
+        const float parsed = ParseLength(candidate, -1.0f, inherited_size);
+        if (parsed > 0.0f) {
+            shorthand.has_size = true;
+            shorthand.size = parsed;
+            size_index = index;
+            size_token = tokens[index];
+            break;
+        }
+    }
+    if (!shorthand.has_size || size_index + 1 >= tokens.size()) {
+        return std::nullopt;
+    }
+
+    for (size_t index = 0; index < size_index; ++index) {
+        const std::string token = Lower(Trim(tokens[index]));
+        if (token == "italic" || token == "oblique" || token == "normal") {
+            shorthand.style = token;
+            continue;
+        }
+        const int parsed_weight = ParseFontWeight(token, -1);
+        if (parsed_weight > 0) {
+            shorthand.weight = parsed_weight;
+        }
+    }
+
+    std::string family;
+    for (size_t index = size_index + 1; index < tokens.size(); ++index) {
+        if (!family.empty()) {
+            family.push_back(' ');
+        }
+        family += tokens[index];
+    }
+    shorthand.family = Trim(family);
+    if (shorthand.family.empty()) {
+        return std::nullopt;
+    }
+    return shorthand;
+}
+
 } // namespace
 
 Color StyleResolver::ParseColor(const std::string& value) {
@@ -410,7 +509,10 @@ Color StyleResolver::ParseColor(const std::string& value) {
     return {};
 }
 
-ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* parent, const RenderOptions& options) const {
+ResolvedStyle StyleResolver::Resolve(const XmlNode& node,
+                                     const ResolvedStyle* parent,
+                                     const RenderOptions& options,
+                                     const std::map<std::string, std::string>* matched_css_properties) const {
     ResolvedStyle style;
     if (parent != nullptr) {
         style = *parent;
@@ -455,6 +557,10 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
         style.font_family = options.default_font_family;
         style.font_size = options.default_font_size;
         style.font_weight = 400;
+        style.font_style = "normal";
+        style.text_decoration = "none";
+        style.letter_spacing = 0.0f;
+        style.word_spacing = 0.0f;
         style.text_anchor = "start";
     }
 
@@ -462,13 +568,19 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
     const auto inline_style = style_it != node.attributes.end() ? ParseInlineStyle(style_it->second) : std::map<std::string, std::string>{};
 
     auto read_value = [&](const std::string& key) -> std::optional<std::string> {
+        const auto inline_it = inline_style.find(key);
+        if (inline_it != inline_style.end()) {
+            return inline_it->second;
+        }
+        if (matched_css_properties != nullptr) {
+            const auto matched_it = matched_css_properties->find(key);
+            if (matched_it != matched_css_properties->end()) {
+                return matched_it->second;
+            }
+        }
         const auto attr_it = node.attributes.find(key);
         if (attr_it != node.attributes.end()) {
             return attr_it->second;
-        }
-        const auto css_it = inline_style.find(key);
-        if (css_it != inline_style.end()) {
-            return css_it->second;
         }
         return std::nullopt;
     };
@@ -528,11 +640,49 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
     if (const auto font_family = read_value("font-family"); font_family.has_value()) {
         style.font_family = *font_family;
     }
+    if (const auto font_shorthand = read_value("font"); font_shorthand.has_value()) {
+        if (const auto parsed = ParseFontShorthand(*font_shorthand, style.font_size); parsed.has_value()) {
+            style.font_size = parsed->size;
+            style.font_family = parsed->family;
+            if (parsed->style.has_value()) {
+                style.font_style = *parsed->style;
+            }
+            if (parsed->weight.has_value()) {
+                style.font_weight = *parsed->weight;
+            }
+        }
+    }
     if (const auto font_size = read_value("font-size"); font_size.has_value()) {
         style.font_size = ParseLength(*font_size, style.font_size, style.font_size);
     }
     if (const auto font_weight = read_value("font-weight"); font_weight.has_value()) {
         style.font_weight = ParseFontWeight(*font_weight, style.font_weight);
+    }
+    if (const auto font_style = read_value("font-style"); font_style.has_value()) {
+        const auto parsed = Lower(Trim(*font_style));
+        if (parsed == "normal" || parsed == "italic" || parsed == "oblique") {
+            style.font_style = parsed;
+        }
+    }
+    if (const auto text_decoration = read_value("text-decoration"); text_decoration.has_value()) {
+        const auto parsed = Lower(Trim(*text_decoration));
+        style.text_decoration = parsed.empty() ? "none" : parsed;
+    }
+    if (const auto letter_spacing = read_value("letter-spacing"); letter_spacing.has_value()) {
+        const auto parsed = Lower(Trim(*letter_spacing));
+        if (parsed == "normal") {
+            style.letter_spacing = 0.0f;
+        } else {
+            style.letter_spacing = ParseLength(*letter_spacing, style.letter_spacing, style.font_size);
+        }
+    }
+    if (const auto word_spacing = read_value("word-spacing"); word_spacing.has_value()) {
+        const auto parsed = Lower(Trim(*word_spacing));
+        if (parsed == "normal") {
+            style.word_spacing = 0.0f;
+        } else {
+            style.word_spacing = ParseLength(*word_spacing, style.word_spacing, style.font_size);
+        }
     }
     if (const auto text_anchor = read_value("text-anchor"); text_anchor.has_value()) {
         const auto anchor = Lower(Trim(*text_anchor));

@@ -1,6 +1,7 @@
 #ifndef CHROMIUM_SVG_CORE_STYLE_RESOLVER_HPP
 #define CHROMIUM_SVG_CORE_STYLE_RESOLVER_HPP
 
+#include <map>
 #include <vector>
 
 #include <optional>
@@ -33,12 +34,19 @@ struct ResolvedStyle {
     std::string font_family;
     float font_size = 0.0f;
     int font_weight = 400;
+    std::string font_style = "normal";
+    std::string text_decoration = "none";
+    float letter_spacing = 0.0f;
+    float word_spacing = 0.0f;
     std::string text_anchor = "start";
 };
 
 class StyleResolver {
 public:
-    ResolvedStyle Resolve(const XmlNode& node, const ResolvedStyle* parent, const RenderOptions& options) const;
+    ResolvedStyle Resolve(const XmlNode& node,
+                          const ResolvedStyle* parent,
+                          const RenderOptions& options,
+                          const std::map<std::string, std::string>* matched_css_properties = nullptr) const;
     static Color ParseColor(const std::string& value);
 };
 

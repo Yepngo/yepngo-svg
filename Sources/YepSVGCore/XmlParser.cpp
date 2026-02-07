@@ -311,6 +311,19 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
             continue;
         }
 
+        if (token.rfind("<![CDATA[", 0) == 0) {
+            if (!node_stack.empty()) {
+                const std::string prefix = "<![CDATA[";
+                const std::string suffix = "]]>";
+                if (token.size() >= prefix.size() + suffix.size() &&
+                    token.compare(token.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    node_stack.back().text += token.substr(prefix.size(),
+                                                           token.size() - prefix.size() - suffix.size());
+                }
+            }
+            continue;
+        }
+
         if (token.rfind("<?", 0) == 0 || token.rfind("<!", 0) == 0) {
             continue;
         }
