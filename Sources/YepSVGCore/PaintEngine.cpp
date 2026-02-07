@@ -4,9 +4,11 @@
 #include <CoreText/CoreText.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <set>
 #include <map>
@@ -1636,7 +1638,635 @@ void PaintNode(const XmlNode& node,
                std::set<std::string>& active_use_ids,
                std::set<std::string>& active_pattern_ids,
                const RenderOptions& options,
-               RenderError& error);
+               RenderError& error,
+               bool apply_filters = true,
+               bool suppress_current_opacity = false);
+
+std::string LocalName(const std::string& name);
+
+struct PixelSurface {
+    size_t width = 0;
+    size_t height = 0;
+    std::vector<uint8_t> rgba;
+};
+
+struct PixelBounds {
+    size_t min_x = 0;
+    size_t min_y = 0;
+    size_t max_x = 0;
+    size_t max_y = 0;
+};
+
+std::optional<std::string> ResolveFilterID(const XmlNode& node, const std::map<std::string, std::string>& inline_style) {
+    const auto filter_value = ReadAttrOrStyle(node, inline_style, "filter");
+    if (!filter_value.has_value()) {
+        return std::nullopt;
+    }
+    return ExtractPaintURLId(*filter_value);
+}
+
+std::optional<PixelSurface> RenderNodeToSurface(const XmlNode& node,
+                                                const StyleResolver& style_resolver,
+                                                const GeometryEngine& geometry_engine,
+                                                const ResolvedStyle* parent_style,
+                                                const GradientMap& gradients,
+                                                const PatternMap& patterns,
+                                                const NodeIdMap& id_map,
+                                                const ColorProfileMap& color_profiles,
+                                                const RenderOptions& options,
+                                                RenderError& error) {
+    const size_t width = static_cast<size_t>(std::max(1.0, std::ceil(std::max(geometry_engine.viewport_width(), 1.0))));
+    const size_t height = static_cast<size_t>(std::max(1.0, std::ceil(std::max(geometry_engine.viewport_height(), 1.0))));
+    const size_t bytes_per_row = width * 4;
+
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bitmap = CGBitmapContextCreate(nullptr,
+                                                width,
+                                                height,
+                                                8,
+                                                bytes_per_row,
+                                                color_space,
+                                                static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    CGColorSpaceRelease(color_space);
+    if (bitmap == nullptr) {
+        return std::nullopt;
+    }
+
+    CGContextTranslateCTM(bitmap, 0.0, static_cast<CGFloat>(height));
+    CGContextScaleCTM(bitmap, 1.0, -1.0);
+
+    std::set<std::string> local_active_use_ids;
+    std::set<std::string> local_active_pattern_ids;
+    RenderError local_error;
+    PaintNode(node,
+              style_resolver,
+              geometry_engine,
+              parent_style,
+              bitmap,
+              gradients,
+              patterns,
+              id_map,
+              color_profiles,
+              local_active_use_ids,
+              local_active_pattern_ids,
+              options,
+              local_error,
+              false,
+              true);
+
+    if (local_error.code != RenderErrorCode::kNone) {
+        CGContextRelease(bitmap);
+        error = local_error;
+        return std::nullopt;
+    }
+
+    const auto* source_data = static_cast<const uint8_t*>(CGBitmapContextGetData(bitmap));
+    const size_t source_stride = CGBitmapContextGetBytesPerRow(bitmap);
+    if (source_data == nullptr || source_stride == 0) {
+        CGContextRelease(bitmap);
+        return std::nullopt;
+    }
+
+    PixelSurface surface;
+    surface.width = width;
+    surface.height = height;
+    surface.rgba.resize(bytes_per_row * height, 0);
+    for (size_t row = 0; row < height; ++row) {
+        std::memcpy(surface.rgba.data() + row * bytes_per_row,
+                    source_data + row * source_stride,
+                    bytes_per_row);
+    }
+    CGContextRelease(bitmap);
+    return surface;
+}
+
+PixelBounds ComputeNonTransparentBounds(const PixelSurface& surface) {
+    PixelBounds bounds{
+        surface.width,
+        surface.height,
+        0,
+        0
+    };
+    bool found = false;
+
+    for (size_t y = 0; y < surface.height; ++y) {
+        for (size_t x = 0; x < surface.width; ++x) {
+            const size_t base = ((y * surface.width) + x) * 4;
+            if (surface.rgba[base + 3] == 0) {
+                continue;
+            }
+            if (!found) {
+                bounds.min_x = x;
+                bounds.max_x = x;
+                bounds.min_y = y;
+                bounds.max_y = y;
+                found = true;
+                continue;
+            }
+            bounds.min_x = std::min(bounds.min_x, x);
+            bounds.max_x = std::max(bounds.max_x, x);
+            bounds.min_y = std::min(bounds.min_y, y);
+            bounds.max_y = std::max(bounds.max_y, y);
+        }
+    }
+
+    if (!found) {
+        bounds.min_x = 0;
+        bounds.min_y = 0;
+        bounds.max_x = surface.width > 0 ? surface.width - 1 : 0;
+        bounds.max_y = surface.height > 0 ? surface.height - 1 : 0;
+    }
+
+    return bounds;
+}
+
+PixelSurface MakeFloodSurface(size_t width, size_t height, const XmlNode& primitive, const PixelBounds& bounds) {
+    PixelSurface surface;
+    surface.width = width;
+    surface.height = height;
+    surface.rgba.resize(width * height * 4, 0);
+    if (width == 0 || height == 0) {
+        return surface;
+    }
+
+    const auto style_it = primitive.attributes.find("style");
+    const auto inline_style = style_it != primitive.attributes.end()
+        ? ParseInlineStyle(style_it->second)
+        : std::map<std::string, std::string>{};
+
+    const auto flood_color_text = ReadAttrOrStyle(primitive, inline_style, "flood-color").value_or("black");
+    const auto flood_opacity_text = ReadAttrOrStyle(primitive, inline_style, "flood-opacity").value_or("1");
+    auto flood_color = StyleResolver::ParseColor(flood_color_text);
+    if (!flood_color.is_valid || flood_color.is_none) {
+        flood_color = StyleResolver::ParseColor("black");
+    }
+
+    const double opacity = std::clamp(ParseDouble(flood_opacity_text, 1.0), 0.0, 1.0);
+    const double alpha = std::clamp(static_cast<double>(flood_color.a) * opacity, 0.0, 1.0);
+    const uint8_t a = static_cast<uint8_t>(std::lround(alpha * 255.0));
+    const uint8_t r = static_cast<uint8_t>(std::lround(std::clamp(static_cast<double>(flood_color.r) * alpha, 0.0, 1.0) * 255.0));
+    const uint8_t g = static_cast<uint8_t>(std::lround(std::clamp(static_cast<double>(flood_color.g) * alpha, 0.0, 1.0) * 255.0));
+    const uint8_t b = static_cast<uint8_t>(std::lround(std::clamp(static_cast<double>(flood_color.b) * alpha, 0.0, 1.0) * 255.0));
+
+    const size_t max_x = std::min(bounds.max_x, width > 0 ? width - 1 : 0);
+    const size_t max_y = std::min(bounds.max_y, height > 0 ? height - 1 : 0);
+    const size_t min_x = std::min(bounds.min_x, max_x);
+    const size_t min_y = std::min(bounds.min_y, max_y);
+
+    for (size_t y = min_y; y <= max_y; ++y) {
+        for (size_t x = min_x; x <= max_x; ++x) {
+            const size_t base = ((y * width) + x) * 4;
+            surface.rgba[base + 0] = r;
+            surface.rgba[base + 1] = g;
+            surface.rgba[base + 2] = b;
+            surface.rgba[base + 3] = a;
+        }
+    }
+    return surface;
+}
+
+double BlendChannel(double cb, double cs, const std::string& mode) {
+    if (mode == "multiply") {
+        return cb * cs;
+    }
+    if (mode == "screen") {
+        return cb + cs - (cb * cs);
+    }
+    if (mode == "darken") {
+        return std::min(cb, cs);
+    }
+    if (mode == "lighten") {
+        return std::max(cb, cs);
+    }
+    return cs;
+}
+
+double SRGBToLinear(double value) {
+    value = std::clamp(value, 0.0, 1.0);
+    if (value <= 0.04045) {
+        return value / 12.92;
+    }
+    return std::pow((value + 0.055) / 1.055, 2.4);
+}
+
+double LinearToSRGB(double value) {
+    value = std::clamp(value, 0.0, 1.0);
+    if (value <= 0.0031308) {
+        return value * 12.92;
+    }
+    return (1.055 * std::pow(value, 1.0 / 2.4)) - 0.055;
+}
+
+PixelSurface BlendSurfaces(const PixelSurface& in_surface, const PixelSurface& in2_surface, const std::string& mode) {
+    PixelSurface out;
+    out.width = in_surface.width;
+    out.height = in_surface.height;
+    out.rgba.resize(out.width * out.height * 4, 0);
+
+    for (size_t i = 0; i < out.width * out.height; ++i) {
+        const size_t base = i * 4;
+        const double s_a = static_cast<double>(in_surface.rgba[base + 3]) / 255.0;
+        const double b_a = static_cast<double>(in2_surface.rgba[base + 3]) / 255.0;
+
+        const auto to_straight = [](uint8_t premul, double alpha) -> double {
+            if (alpha <= 0.0) {
+                return 0.0;
+            }
+            return std::clamp((static_cast<double>(premul) / 255.0) / alpha, 0.0, 1.0);
+        };
+
+        const double s_r = SRGBToLinear(to_straight(in_surface.rgba[base + 0], s_a));
+        const double s_g = SRGBToLinear(to_straight(in_surface.rgba[base + 1], s_a));
+        const double s_b = SRGBToLinear(to_straight(in_surface.rgba[base + 2], s_a));
+        const double b_r = SRGBToLinear(to_straight(in2_surface.rgba[base + 0], b_a));
+        const double b_g = SRGBToLinear(to_straight(in2_surface.rgba[base + 1], b_a));
+        const double b_b = SRGBToLinear(to_straight(in2_surface.rgba[base + 2], b_a));
+
+        const double out_a = std::clamp(s_a + b_a - (s_a * b_a), 0.0, 1.0);
+        const double out_r_premul_linear = std::clamp(s_a * (1.0 - b_a) * s_r +
+                                                      b_a * (1.0 - s_a) * b_r +
+                                                      s_a * b_a * BlendChannel(b_r, s_r, mode), 0.0, 1.0);
+        const double out_g_premul_linear = std::clamp(s_a * (1.0 - b_a) * s_g +
+                                                      b_a * (1.0 - s_a) * b_g +
+                                                      s_a * b_a * BlendChannel(b_g, s_g, mode), 0.0, 1.0);
+        const double out_b_premul_linear = std::clamp(s_a * (1.0 - b_a) * s_b +
+                                                      b_a * (1.0 - s_a) * b_b +
+                                                      s_a * b_a * BlendChannel(b_b, s_b, mode), 0.0, 1.0);
+
+        auto linear_premul_to_srgb_premul = [out_a](double premul_linear) -> double {
+            if (out_a <= 0.0) {
+                return 0.0;
+            }
+            const double straight_linear = std::clamp(premul_linear / out_a, 0.0, 1.0);
+            const double straight_srgb = LinearToSRGB(straight_linear);
+            return std::clamp(straight_srgb * out_a, 0.0, 1.0);
+        };
+
+        const double out_r_premul = linear_premul_to_srgb_premul(out_r_premul_linear);
+        const double out_g_premul = linear_premul_to_srgb_premul(out_g_premul_linear);
+        const double out_b_premul = linear_premul_to_srgb_premul(out_b_premul_linear);
+
+        out.rgba[base + 0] = static_cast<uint8_t>(std::lround(out_r_premul * 255.0));
+        out.rgba[base + 1] = static_cast<uint8_t>(std::lround(out_g_premul * 255.0));
+        out.rgba[base + 2] = static_cast<uint8_t>(std::lround(out_b_premul * 255.0));
+        out.rgba[base + 3] = static_cast<uint8_t>(std::lround(out_a * 255.0));
+    }
+
+    return out;
+}
+
+std::vector<double> ParseNumberList(const std::string& text) {
+    std::vector<double> values;
+    size_t index = 0;
+    while (index < text.size()) {
+        while (index < text.size() &&
+               (std::isspace(static_cast<unsigned char>(text[index])) || text[index] == ',')) {
+            ++index;
+        }
+        if (index >= text.size()) {
+            break;
+        }
+
+        char* end_ptr = nullptr;
+        const double value = std::strtod(text.c_str() + index, &end_ptr);
+        if (end_ptr == text.c_str() + index) {
+            ++index;
+            continue;
+        }
+        values.push_back(value);
+        index = static_cast<size_t>(end_ptr - text.c_str());
+    }
+    return values;
+}
+
+struct RGBAColor {
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    double a = 0.0;
+};
+
+RGBAColor ReadPixelStraightLinear(const PixelSurface& surface, size_t base) {
+    const double alpha = static_cast<double>(surface.rgba[base + 3]) / 255.0;
+    auto to_straight = [alpha](uint8_t premul) -> double {
+        if (alpha <= 0.0) {
+            return 0.0;
+        }
+        return std::clamp((static_cast<double>(premul) / 255.0) / alpha, 0.0, 1.0);
+    };
+
+    RGBAColor color;
+    color.a = alpha;
+    color.r = SRGBToLinear(to_straight(surface.rgba[base + 0]));
+    color.g = SRGBToLinear(to_straight(surface.rgba[base + 1]));
+    color.b = SRGBToLinear(to_straight(surface.rgba[base + 2]));
+    return color;
+}
+
+void WritePixelFromStraightLinear(PixelSurface& surface, size_t base, const RGBAColor& color) {
+    const double alpha = std::clamp(color.a, 0.0, 1.0);
+    const double r = std::clamp(color.r, 0.0, 1.0);
+    const double g = std::clamp(color.g, 0.0, 1.0);
+    const double b = std::clamp(color.b, 0.0, 1.0);
+
+    const double r_srgb = LinearToSRGB(r);
+    const double g_srgb = LinearToSRGB(g);
+    const double b_srgb = LinearToSRGB(b);
+
+    surface.rgba[base + 0] = static_cast<uint8_t>(std::lround(std::clamp(r_srgb * alpha, 0.0, 1.0) * 255.0));
+    surface.rgba[base + 1] = static_cast<uint8_t>(std::lround(std::clamp(g_srgb * alpha, 0.0, 1.0) * 255.0));
+    surface.rgba[base + 2] = static_cast<uint8_t>(std::lround(std::clamp(b_srgb * alpha, 0.0, 1.0) * 255.0));
+    surface.rgba[base + 3] = static_cast<uint8_t>(std::lround(alpha * 255.0));
+}
+
+std::array<double, 20> IdentityColorMatrix() {
+    return {
+        1.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0, 0.0
+    };
+}
+
+std::array<double, 20> MatrixForSaturate(double saturation) {
+    const double s = saturation;
+    return {
+        0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0,
+        0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0,
+        0.0,               0.0,               0.0,               1.0, 0.0
+    };
+}
+
+std::array<double, 20> MatrixForHueRotate(double degrees) {
+    const double radians = degrees * M_PI / 180.0;
+    const double c = std::cos(radians);
+    const double s = std::sin(radians);
+    return {
+        0.213 + c * 0.787 - s * 0.213, 0.715 - c * 0.715 - s * 0.715, 0.072 - c * 0.072 + s * 0.928, 0.0, 0.0,
+        0.213 - c * 0.213 + s * 0.143, 0.715 + c * 0.285 + s * 0.140, 0.072 - c * 0.072 - s * 0.283, 0.0, 0.0,
+        0.213 - c * 0.213 - s * 0.787, 0.715 - c * 0.715 + s * 0.715, 0.072 + c * 0.928 + s * 0.072, 0.0, 0.0,
+        0.0,                            0.0,                            0.0,                            1.0, 0.0
+    };
+}
+
+std::array<double, 20> MatrixForLuminanceToAlpha() {
+    return {
+        0.0,    0.0,    0.0,    0.0, 0.0,
+        0.0,    0.0,    0.0,    0.0, 0.0,
+        0.0,    0.0,    0.0,    0.0, 0.0,
+        0.2126, 0.7152, 0.0722, 0.0, 0.0
+    };
+}
+
+std::array<double, 20> ResolveColorMatrix(const XmlNode& primitive) {
+    const std::string matrix_type = Lower(Trim(primitive.attributes.count("type") ? primitive.attributes.at("type") : "matrix"));
+    const auto values = ParseNumberList(primitive.attributes.count("values") ? primitive.attributes.at("values") : "");
+
+    if (matrix_type == "saturate") {
+        return MatrixForSaturate(values.empty() ? 1.0 : values[0]);
+    }
+    if (matrix_type == "huerotate") {
+        return MatrixForHueRotate(values.empty() ? 0.0 : values[0]);
+    }
+    if (matrix_type == "luminancetoalpha") {
+        return MatrixForLuminanceToAlpha();
+    }
+
+    auto matrix = IdentityColorMatrix();
+    if (values.size() >= 20) {
+        for (size_t i = 0; i < 20; ++i) {
+            matrix[i] = values[i];
+        }
+    }
+    return matrix;
+}
+
+PixelSurface ApplyColorMatrix(const PixelSurface& input, const XmlNode& primitive) {
+    PixelSurface output = input;
+    const auto matrix = ResolveColorMatrix(primitive);
+
+    for (size_t i = 0; i < input.width * input.height; ++i) {
+        const size_t base = i * 4;
+        const auto src = ReadPixelStraightLinear(input, base);
+        RGBAColor dst;
+
+        dst.r = matrix[0] * src.r + matrix[1] * src.g + matrix[2] * src.b + matrix[3] * src.a + matrix[4];
+        dst.g = matrix[5] * src.r + matrix[6] * src.g + matrix[7] * src.b + matrix[8] * src.a + matrix[9];
+        dst.b = matrix[10] * src.r + matrix[11] * src.g + matrix[12] * src.b + matrix[13] * src.a + matrix[14];
+        dst.a = matrix[15] * src.r + matrix[16] * src.g + matrix[17] * src.b + matrix[18] * src.a + matrix[19];
+
+        WritePixelFromStraightLinear(output, base, dst);
+    }
+
+    return output;
+}
+
+PixelSurface CompositeSurfaces(const PixelSurface& in_surface, const PixelSurface& in2_surface, const std::string& op) {
+    PixelSurface out;
+    out.width = in_surface.width;
+    out.height = in_surface.height;
+    out.rgba.resize(out.width * out.height * 4, 0);
+
+    const std::string op_lower = Lower(op);
+    for (size_t i = 0; i < out.width * out.height; ++i) {
+        const size_t base = i * 4;
+        const double a_in = static_cast<double>(in_surface.rgba[base + 3]) / 255.0;
+        const double a_in2 = static_cast<double>(in2_surface.rgba[base + 3]) / 255.0;
+
+        if (op_lower == "in") {
+            out.rgba[base + 0] = static_cast<uint8_t>(std::lround((static_cast<double>(in_surface.rgba[base + 0]) / 255.0) * a_in2 * 255.0));
+            out.rgba[base + 1] = static_cast<uint8_t>(std::lround((static_cast<double>(in_surface.rgba[base + 1]) / 255.0) * a_in2 * 255.0));
+            out.rgba[base + 2] = static_cast<uint8_t>(std::lround((static_cast<double>(in_surface.rgba[base + 2]) / 255.0) * a_in2 * 255.0));
+            out.rgba[base + 3] = static_cast<uint8_t>(std::lround(a_in * a_in2 * 255.0));
+            continue;
+        }
+
+        // "over" default behavior for unhandled operators.
+        const double r = (static_cast<double>(in_surface.rgba[base + 0]) / 255.0) +
+                         (static_cast<double>(in2_surface.rgba[base + 0]) / 255.0) * (1.0 - a_in);
+        const double g = (static_cast<double>(in_surface.rgba[base + 1]) / 255.0) +
+                         (static_cast<double>(in2_surface.rgba[base + 1]) / 255.0) * (1.0 - a_in);
+        const double b = (static_cast<double>(in_surface.rgba[base + 2]) / 255.0) +
+                         (static_cast<double>(in2_surface.rgba[base + 2]) / 255.0) * (1.0 - a_in);
+        const double a = a_in + a_in2 * (1.0 - a_in);
+
+        out.rgba[base + 0] = static_cast<uint8_t>(std::lround(std::clamp(r, 0.0, 1.0) * 255.0));
+        out.rgba[base + 1] = static_cast<uint8_t>(std::lround(std::clamp(g, 0.0, 1.0) * 255.0));
+        out.rgba[base + 2] = static_cast<uint8_t>(std::lround(std::clamp(b, 0.0, 1.0) * 255.0));
+        out.rgba[base + 3] = static_cast<uint8_t>(std::lround(std::clamp(a, 0.0, 1.0) * 255.0));
+    }
+
+    return out;
+}
+
+std::optional<PixelSurface> ExecuteBasicFilterPrimitives(const XmlNode& filter_node, const PixelSurface& source_surface) {
+    std::map<std::string, PixelSurface> surfaces;
+    surfaces["SourceGraphic"] = source_surface;
+    PixelSurface source_alpha = source_surface;
+    for (size_t i = 0; i < source_alpha.width * source_alpha.height; ++i) {
+        const size_t base = i * 4;
+        const uint8_t alpha = source_alpha.rgba[base + 3];
+        source_alpha.rgba[base + 0] = 0;
+        source_alpha.rgba[base + 1] = 0;
+        source_alpha.rgba[base + 2] = 0;
+        source_alpha.rgba[base + 3] = alpha;
+    }
+    surfaces["SourceAlpha"] = std::move(source_alpha);
+    std::string last_key = "SourceGraphic";
+    size_t unnamed_index = 0;
+    const PixelBounds filter_bounds = ComputeNonTransparentBounds(source_surface);
+
+    const auto resolve_input = [&](const std::string& key) -> const PixelSurface* {
+        const auto it = surfaces.find(key);
+        if (it != surfaces.end()) {
+            return &it->second;
+        }
+        const auto last_it = surfaces.find(last_key);
+        return last_it != surfaces.end() ? &last_it->second : nullptr;
+    };
+
+    for (const auto& primitive : filter_node.children) {
+        const auto primitive_name = LocalName(primitive.name);
+        PixelSurface output;
+
+        if (primitive_name == "feflood") {
+            output = MakeFloodSurface(source_surface.width, source_surface.height, primitive, filter_bounds);
+        } else if (primitive_name == "fecolormatrix") {
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            if (in_surface == nullptr) {
+                return std::nullopt;
+            }
+            output = ApplyColorMatrix(*in_surface, primitive);
+        } else if (primitive_name == "fecomposite") {
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const std::string in2_key = Trim(primitive.attributes.count("in2") ? primitive.attributes.at("in2") : "SourceGraphic");
+            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const auto* in2_surface = resolve_input(in2_key.empty() ? "SourceGraphic" : in2_key);
+            if (in_surface == nullptr || in2_surface == nullptr) {
+                return std::nullopt;
+            }
+            const std::string op = Lower(Trim(primitive.attributes.count("operator") ? primitive.attributes.at("operator") : "over"));
+            output = CompositeSurfaces(*in_surface, *in2_surface, op);
+        } else if (primitive_name == "feblend") {
+            const std::string in_key = Trim(primitive.attributes.count("in") ? primitive.attributes.at("in") : "SourceGraphic");
+            const std::string in2_key = Trim(primitive.attributes.count("in2") ? primitive.attributes.at("in2") : "SourceGraphic");
+            const auto* in_surface = resolve_input(in_key.empty() ? "SourceGraphic" : in_key);
+            const auto* in2_surface = resolve_input(in2_key.empty() ? "SourceGraphic" : in2_key);
+            if (in_surface == nullptr || in2_surface == nullptr) {
+                return std::nullopt;
+            }
+
+            const std::string mode = Lower(Trim(primitive.attributes.count("mode") ? primitive.attributes.at("mode") : "normal"));
+            output = BlendSurfaces(*in_surface, *in2_surface, mode);
+        } else {
+            return std::nullopt;
+        }
+
+        auto result_it = primitive.attributes.find("result");
+        std::string result_key;
+        if (result_it != primitive.attributes.end()) {
+            result_key = Trim(result_it->second);
+        }
+        if (result_key.empty()) {
+            result_key = "__result_" + std::to_string(++unnamed_index);
+        }
+        surfaces[result_key] = std::move(output);
+        last_key = result_key;
+    }
+
+    const auto out_it = surfaces.find(last_key);
+    if (out_it == surfaces.end()) {
+        return std::nullopt;
+    }
+    return out_it->second;
+}
+
+CGImageRef CreateImageFromSurface(const PixelSurface& surface) {
+    if (surface.width == 0 || surface.height == 0 || surface.rgba.empty()) {
+        return nullptr;
+    }
+
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bitmap = CGBitmapContextCreate(const_cast<uint8_t*>(surface.rgba.data()),
+                                                surface.width,
+                                                surface.height,
+                                                8,
+                                                surface.width * 4,
+                                                color_space,
+                                                static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    CGColorSpaceRelease(color_space);
+    if (bitmap == nullptr) {
+        return nullptr;
+    }
+    CGImageRef image = CGBitmapContextCreateImage(bitmap);
+    CGContextRelease(bitmap);
+    return image;
+}
+
+bool PaintNodeWithFilter(const XmlNode& node,
+                         const std::map<std::string, std::string>& inline_style,
+                         const ResolvedStyle& node_style,
+                         const StyleResolver& style_resolver,
+                         const GeometryEngine& geometry_engine,
+                         const ResolvedStyle* parent_style,
+                         CGContextRef context,
+                         const GradientMap& gradients,
+                         const PatternMap& patterns,
+                         const NodeIdMap& id_map,
+                         const ColorProfileMap& color_profiles,
+                         const RenderOptions& options,
+                         RenderError& error) {
+    const auto filter_id = ResolveFilterID(node, inline_style);
+    if (!filter_id.has_value()) {
+        return false;
+    }
+    const auto filter_it = id_map.find(*filter_id);
+    if (filter_it == id_map.end() || filter_it->second == nullptr) {
+        return false;
+    }
+    if (LocalName(filter_it->second->name) != "filter") {
+        return false;
+    }
+
+    const auto source_surface = RenderNodeToSurface(node,
+                                                    style_resolver,
+                                                    geometry_engine,
+                                                    parent_style,
+                                                    gradients,
+                                                    patterns,
+                                                    id_map,
+                                                    color_profiles,
+                                                    options,
+                                                    error);
+    if (!source_surface.has_value()) {
+        return false;
+    }
+
+    const auto filtered_surface = ExecuteBasicFilterPrimitives(*filter_it->second, *source_surface);
+    if (!filtered_surface.has_value()) {
+        return false;
+    }
+
+    CGImageRef filtered_image = CreateImageFromSurface(*filtered_surface);
+    if (filtered_image == nullptr) {
+        return false;
+    }
+
+    const double viewport_width = std::max(geometry_engine.viewport_width(), 1.0);
+    const double viewport_height = std::max(geometry_engine.viewport_height(), 1.0);
+    CGContextSaveGState(context);
+    CGContextSetAlpha(context, std::clamp(node_style.opacity, 0.0f, 1.0f));
+    CGContextTranslateCTM(context, 0.0, static_cast<CGFloat>(viewport_height));
+    CGContextScaleCTM(context, 1.0, -1.0);
+    CGContextDrawImage(context,
+                       CGRectMake(0.0, 0.0, static_cast<CGFloat>(viewport_width), static_cast<CGFloat>(viewport_height)),
+                       filtered_image);
+    CGContextRestoreGState(context);
+    CGImageRelease(filtered_image);
+    return true;
+}
 
 bool PaintGradientFill(CGContextRef context,
                        CGPathRef path,
@@ -2220,8 +2850,13 @@ void PaintNode(const XmlNode& node,
                std::set<std::string>& active_use_ids,
                std::set<std::string>& active_pattern_ids,
                const RenderOptions& options,
-               RenderError& error) {
-    const auto style = style_resolver.Resolve(node, parent_style, options);
+               RenderError& error,
+               bool apply_filters,
+               bool suppress_current_opacity) {
+    auto style = style_resolver.Resolve(node, parent_style, options);
+    if (suppress_current_opacity) {
+        style.opacity = 1.0f;
+    }
     const auto style_it = node.attributes.find("style");
     const auto inline_style = style_it != node.attributes.end() ? ParseInlineStyle(style_it->second) : std::map<std::string, std::string>{};
 
@@ -2257,6 +2892,24 @@ void PaintNode(const XmlNode& node,
         lower_name == "mask" ||
         lower_name == "marker" ||
         lower_name == "color-profile") {
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    if (apply_filters &&
+        PaintNodeWithFilter(node,
+                            inline_style,
+                            style,
+                            style_resolver,
+                            geometry_engine,
+                            parent_style,
+                            context,
+                            gradients,
+                            patterns,
+                            id_map,
+                            color_profiles,
+                            options,
+                            error)) {
         CGContextRestoreGState(context);
         return;
     }

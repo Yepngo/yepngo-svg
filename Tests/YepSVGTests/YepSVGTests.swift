@@ -412,6 +412,119 @@ final class YepSVGTests: XCTestCase {
         XCTAssertLessThan(midpoint.b, 100)
     }
 
+    func testFiltersBlend01FixtureBandSamplesMatchReference() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/filters-blend-01-b.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-filters-blend-01-b.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: referenceImage.width, height: referenceImage.height)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Midpoints for each blend stripe in the W3C reference.
+        let samplePoints: [(name: String, x: Int, y: Int)] = [
+            ("normal", 270, 45),
+            ("multiply-1", 270, 84),
+            ("multiply-2", 270, 123),
+            ("multiply-3", 270, 162),
+            ("screen", 270, 201),
+            ("darken", 270, 240),
+            ("lighten", 270, 279),
+        ]
+
+        let tolerance = 28
+        var quantizedReference = Set<String>()
+        var quantizedActual = Set<String>()
+        for sample in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: sample.x, y: sample.y)
+            let expected = try pixelAt(cgImage: referenceImage, x: sample.x, y: sample.y)
+
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)),
+                                     tolerance,
+                                     "\(sample.name) red mismatch actual=\(actual.r) expected=\(expected.r)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)),
+                                     tolerance,
+                                     "\(sample.name) green mismatch actual=\(actual.g) expected=\(expected.g)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)),
+                                     tolerance,
+                                     "\(sample.name) blue mismatch actual=\(actual.b) expected=\(expected.b)")
+
+            let expectedKey = "\(expected.r / 8)-\(expected.g / 8)-\(expected.b / 8)"
+            let actualKey = "\(actual.r / 8)-\(actual.g / 8)-\(actual.b / 8)"
+            quantizedReference.insert(expectedKey)
+            quantizedActual.insert(actualKey)
+        }
+
+        XCTAssertGreaterThanOrEqual(quantizedReference.count, 4, "Reference should have multiple distinct blend outcomes")
+        XCTAssertGreaterThanOrEqual(quantizedActual.count, 4, "Rendered output collapsed blend bands to too few distinct colors")
+    }
+
+    func testFiltersColor01FixtureColorMatrixAndCompositeMatchReference() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/filters-color-01-b.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-filters-color-01-b.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: referenceImage.width, height: referenceImage.height)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let samplePoints: [(name: String, x: Int, y: Int)] = [
+            ("unfiltered-mid", 230, 28),
+            ("matrix-mid", 230, 87),
+            ("saturate-mid", 230, 145),
+            ("huerotate-mid", 230, 203),
+            ("luminanceToAlpha-mid", 230, 261),
+            ("unfiltered-right", 430, 28),
+            ("matrix-right", 430, 87),
+            ("saturate-right", 430, 145),
+            ("huerotate-right", 430, 203),
+            ("luminanceToAlpha-right", 430, 261),
+        ]
+
+        let tolerance = 36
+        for sample in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: sample.x, y: sample.y)
+            let expected = try pixelAt(cgImage: referenceImage, x: sample.x, y: sample.y)
+
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)),
+                                     tolerance,
+                                     "\(sample.name) red mismatch actual=\(actual.r) expected=\(expected.r)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)),
+                                     tolerance,
+                                     "\(sample.name) green mismatch actual=\(actual.g) expected=\(expected.g)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)),
+                                     tolerance,
+                                     "\(sample.name) blue mismatch actual=\(actual.b) expected=\(expected.b)")
+            XCTAssertLessThanOrEqual(abs(Int(actual.a) - Int(expected.a)),
+                                     tolerance,
+                                     "\(sample.name) alpha mismatch actual=\(actual.a) expected=\(expected.a)")
+        }
+    }
+
     func testCoordsTrans02FixtureWithLegacyCommentBlockParsesAndRenders() async throws {
         let root = packageRoot()
         let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-trans-02-t.svg")
