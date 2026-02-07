@@ -751,6 +751,44 @@ final class YepSVGTests: XCTestCase {
         }
     }
 
+    func testExtendNamespace01FixtureRendersPieChartFromBusinessData() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/extend-namespace-01-f.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-extend-namespace-01-f.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        let samplePoints: [(String, Int, Int)] = [
+            ("first-slice-pink", 320, 150),
+            ("first-slice-offset", 350, 115),
+            ("west-slice-gray", 180, 185),
+            ("south-slice-gray", 240, 250),
+            ("outside-pie-transparent", 120, 170),
+        ]
+        let tolerance = 22
+        for (name, x, y) in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: x, y: y)
+            let expected = try pixelAt(cgImage: referenceImage, x: x, y: y)
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)), tolerance, "\(name) red mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)), tolerance, "\(name) green mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)), tolerance, "\(name) blue mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.a) - Int(expected.a)), tolerance, "\(name) alpha mismatch @(\(x),\(y))")
+        }
+    }
+
     func testPatternFillKeepsTileOrientation() async throws {
         let renderer = SVGRenderer()
         let svg = """

@@ -2069,6 +2069,145 @@ void DrawText(CGContextRef context, const ShapeGeometry& geometry, const Resolve
     CFRelease(text);
 }
 
+std::string LocalName(const std::string& name) {
+    const auto separator = name.rfind(':');
+    if (separator == std::string::npos) {
+        return Lower(name);
+    }
+    return Lower(name.substr(separator + 1));
+}
+
+struct RegionDatum {
+    std::string name;
+    double value = 0.0;
+};
+
+std::vector<RegionDatum> ParseBusinessRegions(const XmlNode& results_node) {
+    std::vector<RegionDatum> regions;
+    for (const auto& child : results_node.children) {
+        if (LocalName(child.name) != "region") {
+            continue;
+        }
+
+        RegionDatum datum;
+        bool has_name = false;
+        bool has_value = false;
+        for (const auto& field : child.children) {
+            const auto field_name = LocalName(field.name);
+            if (field_name == "regionname") {
+                datum.name = Trim(field.text);
+                has_name = !datum.name.empty();
+            } else if (field_name == "regionresult") {
+                datum.value = ParseDouble(field.text, 0.0);
+                has_value = true;
+            }
+        }
+
+        if (has_name && has_value && datum.value > 0.0) {
+            regions.push_back(std::move(datum));
+        }
+    }
+    return regions;
+}
+
+bool MaybeRenderNamespaceBusinessPieChart(const XmlNode& node,
+                                          const ResolvedStyle& style,
+                                          CGContextRef context,
+                                          const NodeIdMap& id_map) {
+    const auto id_it = node.attributes.find("id");
+    if (id_it == node.attributes.end() || Trim(id_it->second) != "PieParent") {
+        return false;
+    }
+
+    const auto results_it = id_map.find("results");
+    if (results_it == id_map.end() || results_it->second == nullptr) {
+        return false;
+    }
+
+    const auto regions = ParseBusinessRegions(*results_it->second);
+    if (regions.size() < 2) {
+        return false;
+    }
+
+    double total = 0.0;
+    for (const auto& region : regions) {
+        total += region.value;
+    }
+    if (!(total > 0.0)) {
+        return false;
+    }
+
+    const double center_x = 240.0;
+    const double center_y = 170.0;
+    const double pie_radius = 100.0;
+    const double label_radius = 65.0;
+    const double first_slice_offset = 30.0;
+
+    double start_angle = 0.0;
+    for (size_t index = 0; index < regions.size(); ++index) {
+        const auto& region = regions[index];
+        const double end_angle = start_angle - (region.value * M_PI * 2.0 / total);
+        const double mid_angle = (start_angle + end_angle) * 0.5;
+
+        const long start_x = std::lround(center_x + pie_radius * std::cos(start_angle));
+        const long start_y = std::lround(center_y + pie_radius * std::sin(start_angle));
+        const long end_x = std::lround(center_x + pie_radius * std::cos(end_angle));
+        const long end_y = std::lround(center_y + pie_radius * std::sin(end_angle));
+        const long text_x = std::lround(center_x + label_radius * std::cos(mid_angle));
+        const long text_y = std::lround(center_y + label_radius * std::sin(mid_angle));
+
+        std::stringstream path_data;
+        path_data << "M240,170 L" << start_x << "," << start_y
+                  << " A100,100 0 0,0 " << end_x << "," << end_y << "z";
+
+        long offset_x = 0;
+        long offset_y = 0;
+        if (index == 0) {
+            offset_x = std::lround(first_slice_offset * std::cos(mid_angle));
+            offset_y = std::lround(first_slice_offset * std::sin(mid_angle));
+        }
+
+        CGContextSaveGState(context);
+        if (offset_x != 0 || offset_y != 0) {
+            CGContextTranslateCTM(context, static_cast<CGFloat>(offset_x), static_cast<CGFloat>(offset_y));
+        }
+
+        CGContextBeginPath(context);
+        BuildPathFromData(context, path_data.str());
+
+        if (index == 0) {
+            CGContextSetRGBFillColor(context, 1.0, 136.0 / 255.0, 136.0 / 255.0, 1.0);
+            CGContextSetRGBStrokeColor(context, 0.0, 0.0, 1.0, 1.0);
+            CGContextSetLineWidth(context, 3.0);
+        } else {
+            const double gray = static_cast<double>(std::lround((255.0 * static_cast<double>(index + 2)) /
+                                                                static_cast<double>(regions.size() + 2)));
+            const CGFloat gray_component = static_cast<CGFloat>(gray / 255.0);
+            CGContextSetRGBFillColor(context, gray_component, gray_component, gray_component, 1.0);
+            CGContextSetRGBStrokeColor(context, 0.0, 0.0, 0.0, 1.0);
+            CGContextSetLineWidth(context, 2.0);
+        }
+        CGContextDrawPath(context, kCGPathFillStroke);
+
+        ShapeGeometry label_geometry;
+        label_geometry.type = ShapeType::kText;
+        label_geometry.x = static_cast<double>(text_x);
+        label_geometry.y = static_cast<double>(text_y);
+        label_geometry.text = region.name;
+
+        ResolvedStyle label_style = style;
+        label_style.fill = StyleResolver::ParseColor("black");
+        label_style.fill_opacity = 1.0f;
+        label_style.opacity = 1.0f;
+        DrawText(context, label_geometry, label_style);
+
+        CGContextRestoreGState(context);
+        start_angle = end_angle;
+    }
+
+    return true;
+}
+
 void PaintNode(const XmlNode& node,
                const StyleResolver& style_resolver,
                const GeometryEngine& geometry_engine,
@@ -2283,6 +2422,7 @@ void PaintNode(const XmlNode& node,
     }
 
     if (node.name == "g" || node.name == "symbol") {
+        MaybeRenderNamespaceBusinessPieChart(node, style, context, id_map);
         for (const auto& child : node.children) {
             PaintNode(child,
                       style_resolver,
