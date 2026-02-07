@@ -1,10 +1,12 @@
 import SwiftUI
 import UIKit
 import CoreGraphics
+import ImageIO
 import YepSVG
 
 private struct W3CTestCase: Identifiable, Hashable {
     let id: String
+    let groupID: String
     let svgURL: URL
     let referencePNGURL: URL?
 }
@@ -14,9 +16,12 @@ private final class W3CTestHarnessModel: ObservableObject {
     @Published var suiteRootURL: URL?
     @Published var allTests: [W3CTestCase] = []
     @Published var filteredTests: [W3CTestCase] = []
+    @Published var selectedGroupID: String = "all" {
+        didSet { applyFilter(selectFirstResult: true) }
+    }
     @Published var selectedTestID: String?
     @Published var query: String = "" {
-        didSet { applyFilter() }
+        didSet { applyFilter(selectFirstResult: false) }
     }
 
     @Published var scale: Double = 1.0
@@ -36,6 +41,42 @@ private final class W3CTestHarnessModel: ObservableObject {
 
     var hasSuite: Bool {
         suiteRootURL != nil
+    }
+
+    var availableGroupIDs: [String] {
+        let groups = Set(allTests.map(\.groupID)).sorted(by: Self.compareGroupIDs)
+        return ["all"] + groups
+    }
+
+    var groupedFilteredTests: [(groupID: String, tests: [W3CTestCase])] {
+        let grouped = Dictionary(grouping: filteredTests, by: \.groupID)
+        let sortedKeys = grouped.keys.sorted(by: Self.compareGroupIDs)
+        return sortedKeys.map { key in
+            let tests = (grouped[key] ?? []).sorted { $0.id < $1.id }
+            return (groupID: key, tests: tests)
+        }
+    }
+
+    var selectedIndex: Int? {
+        guard let selectedTestID else { return nil }
+        return filteredTests.firstIndex(where: { $0.id == selectedTestID })
+    }
+
+    var selectedPositionSummary: String {
+        guard let index = selectedIndex else {
+            return "0 / \(filteredTests.count)"
+        }
+        return "\(index + 1) / \(filteredTests.count)"
+    }
+
+    var canSelectPrevious: Bool {
+        guard let index = selectedIndex else { return false }
+        return index > 0
+    }
+
+    var canSelectNext: Bool {
+        guard let index = selectedIndex else { return false }
+        return index + 1 < filteredTests.count
     }
 
     var diffSummary: String {
@@ -84,9 +125,12 @@ private final class W3CTestHarnessModel: ObservableObject {
                 let name = svgURL.deletingPathExtension().lastPathComponent
                 let pngURL = pngDir.appendingPathComponent("full-\(name).png")
                 let reference = FileManager.default.fileExists(atPath: pngURL.path) ? pngURL : nil
-                return W3CTestCase(id: name, svgURL: svgURL, referencePNGURL: reference)
+                return W3CTestCase(id: name, groupID: Self.groupIdentifier(for: name), svgURL: svgURL, referencePNGURL: reference)
             }
-            applyFilter()
+            if !availableGroupIDs.contains(selectedGroupID) {
+                selectedGroupID = "all"
+            }
+            applyFilter(selectFirstResult: false)
 
             if selectedTestID == nil {
                 selectedTestID = filteredTests.first?.id
@@ -112,17 +156,24 @@ private final class W3CTestHarnessModel: ObservableObject {
         defer { isRendering = false }
 
         do {
-            let data = try Data(contentsOf: test.svgURL)
+            let loadedReference: UIImage?
+            if let referenceURL = test.referencePNGURL {
+                loadedReference = loadReferenceImage(at: referenceURL)
+            } else {
+                loadedReference = nil
+            }
+            referenceImage = loadedReference
+
             var options = SVGRenderOptions.default
             options.scale = scale
+            options.defaultFontSize = 12
             options.backgroundColor = UIColor.clear.cgColor
-            renderedImage = try await renderer.render(svgData: data, options: options)
-
-            if let referenceURL = test.referencePNGURL {
-                referenceImage = UIImage(contentsOfFile: referenceURL.path)
-            } else {
-                referenceImage = nil
+            if let referenceSize = loadedReference?.cgImage.map({ CGSize(width: $0.width, height: $0.height) }) {
+                options.viewportSize = referenceSize
             }
+
+            let rendered = try await renderer.render(svgFileURL: test.svgURL, options: options)
+            renderedImage = normalizeOrientation(rendered)
 
             if let renderedCG = renderedImage?.cgImage,
                let referenceCG = referenceImage?.cgImage {
@@ -138,22 +189,93 @@ private final class W3CTestHarnessModel: ObservableObject {
         }
     }
 
+    private func loadReferenceImage(at url: URL) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return nil
+        }
+        return normalizeOrientation(UIImage(cgImage: image))
+    }
+
+    private func normalizeOrientation(_ image: UIImage) -> UIImage {
+        guard image.imageOrientation != .up else { return image }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = image.scale
+        format.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: image.size))
+        }
+    }
+
     func selectTest(_ test: W3CTestCase) {
         selectedTestID = test.id
     }
 
-    private func applyFilter() {
+    func selectPrevious() {
+        guard let index = selectedIndex, index > 0 else { return }
+        selectedTestID = filteredTests[index - 1].id
+    }
+
+    func selectNext() {
+        guard let index = selectedIndex, index + 1 < filteredTests.count else { return }
+        selectedTestID = filteredTests[index + 1].id
+    }
+
+    func selectRandom() {
+        guard !filteredTests.isEmpty else { return }
+        selectedTestID = filteredTests.randomElement()?.id
+    }
+
+    private func applyFilter(selectFirstResult: Bool) {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if needle.isEmpty {
-            filteredTests = allTests
-        } else {
-            filteredTests = allTests.filter { $0.id.lowercased().contains(needle) }
+        filteredTests = allTests.filter { test in
+            let groupMatches = selectedGroupID == "all" || test.groupID == selectedGroupID
+            let queryMatches = needle.isEmpty || test.id.lowercased().contains(needle)
+            return groupMatches && queryMatches
+        }
+
+        if selectFirstResult {
+            self.selectedTestID = filteredTests.first?.id
+            return
         }
 
         if let selectedTestID,
            !filteredTests.contains(where: { $0.id == selectedTestID }) {
             self.selectedTestID = filteredTests.first?.id
         }
+    }
+
+    static func groupIdentifier(for testID: String) -> String {
+        let parts = testID.split(separator: "-", omittingEmptySubsequences: true)
+        if parts.count >= 2 {
+            return "\(parts[0])-\(parts[1])"
+        }
+        return parts.first.map(String.init) ?? "misc"
+    }
+
+    private static func compareGroupIDs(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsRank = groupSortRank(lhs)
+        let rhsRank = groupSortRank(rhs)
+        if lhsRank != rhsRank {
+            return lhsRank < rhsRank
+        }
+        return lhs < rhs
+    }
+
+    private static func groupSortRank(_ groupID: String) -> Int {
+        let lower = groupID.lowercased()
+        if lower.hasPrefix("animate") || lower.contains("animation") {
+            return 1
+        }
+        return 0
+    }
+
+    func groupDisplayName(for groupID: String) -> String {
+        if groupID == "all" {
+            return "All"
+        }
+        return groupID.replacingOccurrences(of: "-", with: " ").capitalized
     }
 
     private func pixelDiffRatio(lhs: CGImage, rhs: CGImage) -> Double {
@@ -209,131 +331,199 @@ private final class W3CTestHarnessModel: ObservableObject {
 
 struct W3CTestHarnessView: View {
     @StateObject private var model = W3CTestHarnessModel()
+    @State private var isBrowserPresented: Bool = false
 
     var body: some View {
         NavigationView {
-            VStack(alignment: .leading, spacing: 12) {
-                if !model.hasSuite {
-                    Text("W3C SVG 1.1 Harness")
-                        .font(.title2.weight(.semibold))
-                    Text(model.errorMessage ?? "Suite not available")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Text("Bundle `Resources/W3CSuite` from W3C full suite archive.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                } else {
-                    TextField("Filter tests (e.g. shapes-circle)", text: $model.query)
-                        .textFieldStyle(.roundedBorder)
-
-                    HStack {
-                        Text("\(model.filteredTests.count) tests")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if !model.hasSuite {
+                        Text(model.errorMessage ?? "Suite not available")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
-                        Spacer()
-                        if let selected = model.selectedTest {
-                            Text(selected.id)
+                        Text("Bundle `Resources/W3CSuite` from W3C full suite archive.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        TextField("Filter tests (e.g. shapes-circle)", text: $model.query)
+                            .textFieldStyle(.roundedBorder)
+
+                        Picker("Category", selection: $model.selectedGroupID) {
+                            ForEach(model.availableGroupIDs, id: \.self) { groupID in
+                                Text(model.groupDisplayName(for: groupID)).tag(groupID)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        HStack {
+                            Text("\(model.filteredTests.count) tests")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(model.selectedPositionSummary)
                                 .font(.footnote.monospaced())
                                 .foregroundStyle(.secondary)
                         }
-                    }
 
-                    List(model.filteredTests) { test in
-                        Button {
-                            model.selectTest(test)
-                            Task { await model.renderSelected() }
-                        } label: {
-                            HStack {
-                                Text(test.id)
-                                    .font(.system(.body, design: .monospaced))
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                Button {
+                                    model.selectPrevious()
+                                } label: {
+                                    Label("Previous", systemImage: "chevron.left")
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!model.canSelectPrevious)
+
+                                Button {
+                                    model.selectNext()
+                                } label: {
+                                    Label("Next", systemImage: "chevron.right")
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(!model.canSelectNext)
+
                                 Spacer()
-                                if test.referencePNGURL != nil {
-                                    Image(systemName: "photo")
+
+                                Button {
+                                    model.selectRandom()
+                                } label: {
+                                    Label("Random", systemImage: "shuffle")
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            HStack(spacing: 10) {
+                                if let selected = model.selectedTest {
+                                    Text(selected.id)
+                                        .font(.system(.footnote, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                } else {
+                                    Text("No test selected")
+                                        .font(.footnote)
                                         .foregroundStyle(.secondary)
                                 }
+                                Spacer()
+                                Button {
+                                    isBrowserPresented = true
+                                } label: {
+                                    Label("Browse Tests", systemImage: "list.bullet")
+                                }
+                                .buttonStyle(.bordered)
                             }
                         }
-                        .buttonStyle(.plain)
-                    }
-                    .frame(height: 240)
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Scale")
-                            Spacer()
-                            Text(String(format: "%.2fx", model.scale))
-                                .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Scale")
+                                Spacer()
+                                Text(String(format: "%.2fx", model.scale))
+                                    .foregroundStyle(.secondary)
+                            }
+                            Slider(value: $model.scale, in: 0.5...2.0, step: 0.1)
                         }
-                        Slider(value: $model.scale, in: 0.5...2.0, step: 0.1)
-                    }
 
-                    Button {
-                        Task { await model.renderSelected() }
-                    } label: {
-                        Text("Render Selected Test")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+                        Button {
+                            Task { await model.renderSelected() }
+                        } label: {
+                            Text("Render Selected Test")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
 
-                    if model.isRendering {
-                        ProgressView("Rendering…")
-                            .frame(maxWidth: .infinity, alignment: .center)
-                    }
+                        if model.isRendering {
+                            ProgressView("Rendering…")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
 
-                    if let rendered = model.renderedImage {
-                        ScrollView(.horizontal) {
-                            HStack(alignment: .top, spacing: 12) {
-                                VStack {
+                        if let rendered = model.renderedImage {
+                            VStack(alignment: .leading, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 4) {
                                     Text("YepSVG")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                     Image(uiImage: rendered)
                                         .resizable()
                                         .scaledToFit()
-                                        .frame(width: 280, height: 220)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 220)
                                         .background(Color.white)
                                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 }
 
                                 if let reference = model.referenceImage {
-                                    VStack {
+                                    VStack(alignment: .leading, spacing: 4) {
                                         Text("W3C PNG")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                         Image(uiImage: reference)
                                             .resizable()
                                             .scaledToFit()
-                                            .frame(width: 280, height: 220)
+                                            .frame(maxWidth: .infinity)
+                                            .frame(height: 220)
                                             .background(Color.white)
                                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                     }
                                 }
                             }
-                            .padding(.vertical, 4)
+                        }
+
+                        if model.referenceImage != nil {
+                            Text(model.diffSummary)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let errorMessage = model.errorMessage {
+                            Text(errorMessage)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
                         }
                     }
-
-                    if model.referenceImage != nil {
-                        Text(model.diffSummary)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if let errorMessage = model.errorMessage {
-                        Text(errorMessage)
-                            .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-
-                    Spacer(minLength: 0)
                 }
+                .padding()
             }
-            .padding()
-            .navigationTitle("W3C Harness")
+            .navigationBarTitleDisplayMode(.inline)
             .task {
                 model.loadSuiteFromBundle()
                 await model.renderSelected()
+            }
+            .onChange(of: model.selectedTestID) { _ in
+                Task { await model.renderSelected() }
+            }
+            .sheet(isPresented: $isBrowserPresented) {
+                NavigationView {
+                    List {
+                        ForEach(model.groupedFilteredTests, id: \.groupID) { group in
+                            Section(model.groupDisplayName(for: group.groupID)) {
+                                ForEach(group.tests) { test in
+                                    Button {
+                                        model.selectTest(test)
+                                        isBrowserPresented = false
+                                    } label: {
+                                        HStack {
+                                            Text(test.id)
+                                                .font(.system(.body, design: .monospaced))
+                                            Spacer()
+                                            if test.referencePNGURL != nil {
+                                                Image(systemName: "photo")
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                    .navigationTitle("Choose Test")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { isBrowserPresented = false }
+                        }
+                    }
+                }
             }
         }
     }

@@ -34,7 +34,9 @@ public final class SVGRenderer: @unchecked Sendable {
         } catch {
             throw SVGRenderError.invalidDocument("Failed to load SVG at \(svgFileURL.path): \(error.localizedDescription)")
         }
-        return try await render(svgData: data, options: options)
+
+        let rewritten = rewriteRelativeResourceReferences(in: data, relativeTo: svgFileURL.deletingLastPathComponent())
+        return try await render(svgData: rewritten, options: options)
     }
 
     private func preflightExternalResourcesIfNeeded(svgData: Data, options: SVGRenderOptions) async throws {
@@ -102,5 +104,43 @@ public final class SVGRenderer: @unchecked Sendable {
             return .font
         }
         return .other
+    }
+
+    private func rewriteRelativeResourceReferences(in svgData: Data, relativeTo baseDirectoryURL: URL) -> Data {
+        guard let text = String(data: svgData, encoding: .utf8) else {
+            return svgData
+        }
+
+        let pattern = #"(?:href|xlink:href)\s*=\s*(['"])([^'"]+)\1"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return svgData
+        }
+
+        let mutable = NSMutableString(string: text)
+        let range = NSRange(location: 0, length: mutable.length)
+        let matches = regex.matches(in: text, options: [], range: range)
+        for match in matches.reversed() {
+            guard match.numberOfRanges >= 3 else { continue }
+            let hrefRange = match.range(at: 2)
+            guard hrefRange.location != NSNotFound, hrefRange.length > 0 else { continue }
+
+            let href = mutable.substring(with: hrefRange).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard shouldResolveRelativePath(href) else { continue }
+
+            let resolved = URL(fileURLWithPath: href, relativeTo: baseDirectoryURL).standardizedFileURL.absoluteString
+            mutable.replaceCharacters(in: hrefRange, with: resolved)
+        }
+
+        return mutable.data(using: String.Encoding.utf8.rawValue) ?? svgData
+    }
+
+    private func shouldResolveRelativePath(_ href: String) -> Bool {
+        if href.isEmpty || href.hasPrefix("#") || href.hasPrefix("data:") || href.hasPrefix("/") {
+            return false
+        }
+        if let scheme = URL(string: href)?.scheme, !scheme.isEmpty {
+            return false
+        }
+        return true
     }
 }

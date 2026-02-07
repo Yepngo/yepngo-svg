@@ -51,10 +51,25 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
 
     auto begin = std::sregex_iterator(text.begin(), text.end(), kTokenRegex);
     auto end = std::sregex_iterator();
+    bool in_comment_block = false;
 
     for (auto it = begin; it != end; ++it) {
         const auto token = (*it).str();
         if (token.empty()) {
+            continue;
+        }
+
+        if (in_comment_block) {
+            if (token.find("-->") != std::string::npos) {
+                in_comment_block = false;
+            }
+            continue;
+        }
+
+        if (token.rfind("<!--", 0) == 0) {
+            if (token.find("-->") == std::string::npos) {
+                in_comment_block = true;
+            }
             continue;
         }
 
@@ -66,7 +81,7 @@ std::optional<XmlNode> XmlParser::Parse(const std::string& text, RenderError& er
             continue;
         }
 
-        if (token.rfind("<!--", 0) == 0 || token.rfind("<?", 0) == 0 || token.rfind("<!DOCTYPE", 0) == 0) {
+        if (token.rfind("<?", 0) == 0 || token.rfind("<!DOCTYPE", 0) == 0) {
             continue;
         }
 

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <set>
 #include <map>
 #include <optional>
@@ -48,8 +49,22 @@ struct GradientDefinition {
     std::vector<GradientStop> stops;
 };
 
+struct PatternDefinition {
+    std::string id;
+    bool pattern_units_user_space = false;
+    bool content_units_user_space = true;
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    double x = 0.0;
+    double y = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+    const XmlNode* node = nullptr;
+};
+
 using GradientMap = std::map<std::string, GradientDefinition>;
+using PatternMap = std::map<std::string, PatternDefinition>;
 using NodeIdMap = std::map<std::string, const XmlNode*>;
+using ColorProfileMap = std::map<std::string, std::string>;
 
 std::string Trim(const std::string& value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -812,6 +827,255 @@ std::optional<std::string> ExtractHrefID(const XmlNode& node) {
     return value.substr(1);
 }
 
+std::optional<std::string> ExtractHrefValue(const XmlNode& node) {
+    const auto href_it = node.attributes.find("href");
+    const auto xlink_href_it = node.attributes.find("xlink:href");
+    if (href_it != node.attributes.end()) {
+        const auto value = Trim(href_it->second);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    if (xlink_href_it != node.attributes.end()) {
+        const auto value = Trim(xlink_href_it->second);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> ResolveLocalFilePathFromHref(const std::string& raw_href) {
+    const auto href = Trim(raw_href);
+    if (href.empty()) {
+        return std::nullopt;
+    }
+    if (href.rfind("http://", 0) == 0 || href.rfind("https://", 0) == 0) {
+        return std::nullopt;
+    }
+    if (href.rfind("file://", 0) == 0) {
+        CFURLRef url = CFURLCreateWithBytes(kCFAllocatorDefault,
+                                            reinterpret_cast<const UInt8*>(href.data()),
+                                            static_cast<CFIndex>(href.size()),
+                                            kCFStringEncodingUTF8,
+                                            nullptr);
+        if (url == nullptr) {
+            return std::nullopt;
+        }
+        CFStringRef path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+        CFRelease(url);
+        if (path == nullptr) {
+            return std::nullopt;
+        }
+        char buffer[4096];
+        const bool ok = CFStringGetCString(path, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+        CFRelease(path);
+        if (!ok) {
+            return std::nullopt;
+        }
+        return std::string(buffer);
+    }
+    return href;
+}
+
+std::optional<std::vector<uint8_t>> LoadBytesFromHref(const std::string& raw_href) {
+    const auto href = Trim(raw_href);
+    if (href.empty()) {
+        return std::nullopt;
+    }
+    if (href.rfind("data:", 0) == 0) {
+        return DecodeDataURL(href);
+    }
+    const auto path = ResolveLocalFilePathFromHref(href);
+    if (!path.has_value()) {
+        return std::nullopt;
+    }
+
+    std::ifstream input(*path, std::ios::binary);
+    if (!input.is_open()) {
+        return std::nullopt;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) {
+        return std::nullopt;
+    }
+    return bytes;
+}
+
+void CollectColorProfiles(const XmlNode& node, ColorProfileMap& profiles) {
+    if (Lower(node.name) == "color-profile") {
+        const auto href = ExtractHrefValue(node);
+        if (href.has_value()) {
+            const auto add_key = [&](const std::string& raw_key) {
+                const auto key = Trim(raw_key);
+                if (key.empty()) {
+                    return;
+                }
+                profiles[key] = *href;
+                profiles[Lower(key)] = *href;
+            };
+            if (const auto id_it = node.attributes.find("id"); id_it != node.attributes.end()) {
+                add_key(id_it->second);
+            }
+            if (const auto name_it = node.attributes.find("name"); name_it != node.attributes.end()) {
+                add_key(name_it->second);
+            }
+        }
+    }
+    for (const auto& child : node.children) {
+        CollectColorProfiles(child, profiles);
+    }
+}
+
+std::optional<std::string> ExtractColorProfileReference(const std::string& raw_value) {
+    const auto value = Trim(raw_value);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    const auto lower = Lower(value);
+    if (lower == "auto" || lower == "srgb" || lower == "inherit") {
+        return std::nullopt;
+    }
+    if (lower.rfind("url(", 0) == 0) {
+        const auto close = value.find(')');
+        if (close == std::string::npos || close <= 4) {
+            return std::nullopt;
+        }
+        auto inside = Trim(value.substr(4, close - 4));
+        if (!inside.empty() && inside.front() == '#') {
+            inside.erase(inside.begin());
+        }
+        if (inside.size() >= 2 &&
+            ((inside.front() == '\'' && inside.back() == '\'') ||
+             (inside.front() == '"' && inside.back() == '"'))) {
+            inside = inside.substr(1, inside.size() - 2);
+        }
+        inside = Trim(inside);
+        if (inside.empty()) {
+            return std::nullopt;
+        }
+        return inside;
+    }
+    return value;
+}
+
+CGColorSpaceRef CreateICCColorSpaceFromHref(const std::string& profile_href) {
+    const auto bytes = LoadBytesFromHref(profile_href);
+    if (!bytes.has_value() || bytes->empty()) {
+        return nullptr;
+    }
+
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes->data(), static_cast<CFIndex>(bytes->size()));
+    if (data == nullptr) {
+        return nullptr;
+    }
+    CGColorSpaceRef color_space = CGColorSpaceCreateWithICCData(data);
+    CFRelease(data);
+    return color_space;
+}
+
+CGImageRef ConvertImageFromAssignedICCProfile(CGImageRef image, CGColorSpaceRef source_color_space) {
+    if (image == nullptr || source_color_space == nullptr) {
+        return nullptr;
+    }
+
+    const size_t width = CGImageGetWidth(image);
+    const size_t height = CGImageGetHeight(image);
+    if (width == 0 || height == 0) {
+        return nullptr;
+    }
+
+    CGColorSpaceRef rgba_color_space = CGColorSpaceCreateDeviceRGB();
+    if (rgba_color_space == nullptr) {
+        return nullptr;
+    }
+
+    CGContextRef extraction_context = CGBitmapContextCreate(nullptr,
+                                                            width,
+                                                            height,
+                                                            8,
+                                                            0,
+                                                            rgba_color_space,
+                                                            static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    if (extraction_context == nullptr) {
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+    CGContextDrawImage(extraction_context, CGRectMake(0.0, 0.0, width, height), image);
+
+    const auto extraction_data = static_cast<const UInt8*>(CGBitmapContextGetData(extraction_context));
+    const size_t bytes_per_row = CGBitmapContextGetBytesPerRow(extraction_context);
+    const size_t total_size = bytes_per_row * height;
+    if (extraction_data == nullptr || total_size == 0) {
+        CGContextRelease(extraction_context);
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+
+    CFDataRef source_data = CFDataCreate(kCFAllocatorDefault, extraction_data, static_cast<CFIndex>(total_size));
+    CGContextRelease(extraction_context);
+    if (source_data == nullptr) {
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+
+    CGDataProviderRef source_provider = CGDataProviderCreateWithCFData(source_data);
+    CFRelease(source_data);
+    if (source_provider == nullptr) {
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+
+    CGImageRef source_tagged = CGImageCreate(width,
+                                             height,
+                                             8,
+                                             32,
+                                             bytes_per_row,
+                                             source_color_space,
+                                             static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast),
+                                             source_provider,
+                                             nullptr,
+                                             true,
+                                             kCGRenderingIntentDefault);
+    CGDataProviderRelease(source_provider);
+    if (source_tagged == nullptr) {
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+
+    CGColorSpaceRef destination_space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (destination_space == nullptr) {
+        destination_space = CGColorSpaceCreateDeviceRGB();
+    }
+    if (destination_space == nullptr) {
+        CGImageRelease(source_tagged);
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+
+    CGContextRef conversion_context = CGBitmapContextCreate(nullptr,
+                                                            width,
+                                                            height,
+                                                            8,
+                                                            0,
+                                                            destination_space,
+                                                            static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    if (conversion_context == nullptr) {
+        CGColorSpaceRelease(destination_space);
+        CGImageRelease(source_tagged);
+        CGColorSpaceRelease(rgba_color_space);
+        return nullptr;
+    }
+    CGContextDrawImage(conversion_context, CGRectMake(0.0, 0.0, width, height), source_tagged);
+    CGImageRelease(source_tagged);
+
+    CGImageRef converted = CGBitmapContextCreateImage(conversion_context);
+    CGContextRelease(conversion_context);
+    CGColorSpaceRelease(destination_space);
+    CGColorSpaceRelease(rgba_color_space);
+    return converted;
+}
+
 CGAffineTransform ParseTransformList(const std::string& raw) {
     CGAffineTransform transform = CGAffineTransformIdentity;
     size_t i = 0;
@@ -940,6 +1204,19 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
         GradientDefinition gradient;
         gradient.type = node.name == "linearGradient" ? GradientType::kLinear : GradientType::kRadial;
 
+        const auto gradient_style_it = node.attributes.find("style");
+        const auto gradient_inline_style = gradient_style_it != node.attributes.end()
+            ? ParseInlineStyle(gradient_style_it->second)
+            : std::map<std::string, std::string>{};
+
+        Color gradient_color = StyleResolver::ParseColor("black");
+        if (const auto color_value = ReadAttrOrStyle(node, gradient_inline_style, "color"); color_value.has_value()) {
+            const auto parsed = StyleResolver::ParseColor(*color_value);
+            if (parsed.is_valid && !parsed.is_none) {
+                gradient_color = parsed;
+            }
+        }
+
         const auto id_it = node.attributes.find("id");
         if (id_it != node.attributes.end()) {
             gradient.id = id_it->second;
@@ -992,14 +1269,27 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
             stop.color = StyleResolver::ParseColor("black");
             stop.opacity = 1.0;
 
+            Color stop_current_color = gradient_color;
+            if (const auto stop_color_prop = ReadAttrOrStyle(stop_node, inline_style, "color"); stop_color_prop.has_value()) {
+                const auto parsed = StyleResolver::ParseColor(*stop_color_prop);
+                if (parsed.is_valid && !parsed.is_none) {
+                    stop_current_color = parsed;
+                }
+            }
+
             if (const auto offset = ReadAttrOrStyle(stop_node, inline_style, "offset"); offset.has_value()) {
                 stop.offset = ParseOffset(*offset);
             }
 
             if (const auto stop_color = ReadAttrOrStyle(stop_node, inline_style, "stop-color"); stop_color.has_value()) {
-                const auto parsed_color = StyleResolver::ParseColor(*stop_color);
-                if (parsed_color.is_valid) {
-                    stop.color = parsed_color;
+                const auto stop_color_lower = Lower(Trim(*stop_color));
+                if (stop_color_lower == "currentcolor") {
+                    stop.color = stop_current_color;
+                } else {
+                    const auto parsed_color = StyleResolver::ParseColor(*stop_color);
+                    if (parsed_color.is_valid) {
+                        stop.color = parsed_color;
+                    }
                 }
             }
 
@@ -1036,6 +1326,48 @@ void CollectGradients(const XmlNode& node, GradientMap& gradients) {
     }
 }
 
+void CollectPatterns(const XmlNode& node, PatternMap& patterns) {
+    if (Lower(node.name) == "pattern") {
+        PatternDefinition pattern;
+        pattern.node = &node;
+
+        if (const auto id_it = node.attributes.find("id"); id_it != node.attributes.end()) {
+            pattern.id = Trim(id_it->second);
+        }
+
+        if (const auto units_it = node.attributes.find("patternUnits"); units_it != node.attributes.end()) {
+            pattern.pattern_units_user_space = Lower(Trim(units_it->second)) == "userspaceonuse";
+        }
+        if (const auto content_units_it = node.attributes.find("patternContentUnits"); content_units_it != node.attributes.end()) {
+            pattern.content_units_user_space = Lower(Trim(content_units_it->second)) == "userspaceonuse";
+        }
+        if (const auto transform_it = node.attributes.find("patternTransform"); transform_it != node.attributes.end()) {
+            pattern.transform = ParseTransformList(transform_it->second);
+        }
+
+        if (const auto x_it = node.attributes.find("x"); x_it != node.attributes.end()) {
+            pattern.x = ParseCoordinate(x_it->second, 0.0);
+        }
+        if (const auto y_it = node.attributes.find("y"); y_it != node.attributes.end()) {
+            pattern.y = ParseCoordinate(y_it->second, 0.0);
+        }
+        if (const auto width_it = node.attributes.find("width"); width_it != node.attributes.end()) {
+            pattern.width = ParseCoordinate(width_it->second, 0.0);
+        }
+        if (const auto height_it = node.attributes.find("height"); height_it != node.attributes.end()) {
+            pattern.height = ParseCoordinate(height_it->second, 0.0);
+        }
+
+        if (!pattern.id.empty()) {
+            patterns[pattern.id] = pattern;
+        }
+    }
+
+    for (const auto& child : node.children) {
+        CollectPatterns(child, patterns);
+    }
+}
+
 void ApplyColor(CGContextRef context, const Color& color, float opacity, bool stroke) {
     if (!color.is_valid || color.is_none) {
         return;
@@ -1069,6 +1401,20 @@ CGLineCap LineCapFromStyle(const std::string& cap_style) {
     }
     return kCGLineCapButt;
 }
+
+void PaintNode(const XmlNode& node,
+               const StyleResolver& style_resolver,
+               const GeometryEngine& geometry_engine,
+               const ResolvedStyle* parent_style,
+               CGContextRef context,
+               const GradientMap& gradients,
+               const PatternMap& patterns,
+               const NodeIdMap& id_map,
+               const ColorProfileMap& color_profiles,
+               std::set<std::string>& active_use_ids,
+               std::set<std::string>& active_pattern_ids,
+               const RenderOptions& options,
+               RenderError& error);
 
 bool PaintGradientFill(CGContextRef context,
                        CGPathRef path,
@@ -1165,6 +1511,175 @@ bool PaintGradientFill(CGContextRef context,
     return true;
 }
 
+bool PaintPatternFill(CGContextRef context,
+                      CGPathRef path,
+                      const ResolvedStyle& style,
+                      const StyleResolver& style_resolver,
+                      const GeometryEngine& geometry_engine,
+                      const GradientMap& gradients,
+                      const PatternMap& patterns,
+                      const NodeIdMap& id_map,
+                      const ColorProfileMap& color_profiles,
+                      std::set<std::string>& active_use_ids,
+                      std::set<std::string>& active_pattern_ids,
+                      const RenderOptions& options,
+                      RenderError& error,
+                      double inherited_opacity) {
+    const auto pattern_id = ExtractPaintURLId(style.fill_paint);
+    if (!pattern_id.has_value()) {
+        return false;
+    }
+
+    const auto pattern_it = patterns.find(*pattern_id);
+    if (pattern_it == patterns.end()) {
+        return false;
+    }
+    if (active_pattern_ids.find(*pattern_id) != active_pattern_ids.end()) {
+        return false;
+    }
+
+    const auto& pattern = pattern_it->second;
+    if (pattern.node == nullptr) {
+        return false;
+    }
+
+    const CGRect bbox = CGPathGetPathBoundingBox(path);
+    const auto resolve_x = [&](double value) -> double {
+        return pattern.pattern_units_user_space ? value : (bbox.origin.x + value * bbox.size.width);
+    };
+    const auto resolve_y = [&](double value) -> double {
+        return pattern.pattern_units_user_space ? value : (bbox.origin.y + value * bbox.size.height);
+    };
+    const auto resolve_w = [&](double value) -> double {
+        return pattern.pattern_units_user_space ? value : (value * bbox.size.width);
+    };
+    const auto resolve_h = [&](double value) -> double {
+        return pattern.pattern_units_user_space ? value : (value * bbox.size.height);
+    };
+
+    const double tile_x = resolve_x(pattern.x);
+    const double tile_y = resolve_y(pattern.y);
+    const double tile_w = std::fabs(resolve_w(pattern.width));
+    const double tile_h = std::fabs(resolve_h(pattern.height));
+    if (!(tile_w > 0.0) || !(tile_h > 0.0)) {
+        return false;
+    }
+
+    const size_t tile_px_w = static_cast<size_t>(std::max(1.0, std::ceil(tile_w)));
+    const size_t tile_px_h = static_cast<size_t>(std::max(1.0, std::ceil(tile_h)));
+
+    CGColorSpaceRef tile_cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef tile_context = CGBitmapContextCreate(nullptr,
+                                                      tile_px_w,
+                                                      tile_px_h,
+                                                      8,
+                                                      0,
+                                                      tile_cs,
+                                                      static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast));
+    CGColorSpaceRelease(tile_cs);
+    if (tile_context == nullptr) {
+        return false;
+    }
+
+    // Mirror the renderer's Y-down coordinate convention in tile space.
+    CGContextTranslateCTM(tile_context, 0.0, static_cast<CGFloat>(tile_px_h));
+    CGContextScaleCTM(tile_context, 1.0, -1.0);
+
+    const CGFloat scale_x = static_cast<CGFloat>(static_cast<double>(tile_px_w) / tile_w);
+    const CGFloat scale_y = static_cast<CGFloat>(static_cast<double>(tile_px_h) / tile_h);
+    CGContextScaleCTM(tile_context, scale_x, scale_y);
+
+    if (!CGAffineTransformEqualToTransform(pattern.transform, CGAffineTransformIdentity)) {
+        CGContextConcatCTM(tile_context, pattern.transform);
+    }
+
+    ResolvedStyle pattern_style = style_resolver.Resolve(*pattern.node, nullptr, options);
+    active_pattern_ids.insert(*pattern_id);
+
+    if (pattern.content_units_user_space) {
+        for (const auto& child : pattern.node->children) {
+            PaintNode(child,
+                      style_resolver,
+                      geometry_engine,
+                      &pattern_style,
+                      tile_context,
+                      gradients,
+                      patterns,
+                      id_map,
+                      color_profiles,
+                      active_use_ids,
+                      active_pattern_ids,
+                      options,
+                      error);
+            if (error.code != RenderErrorCode::kNone) {
+                break;
+            }
+        }
+    } else {
+        CGContextSaveGState(tile_context);
+        CGContextScaleCTM(tile_context, bbox.size.width, bbox.size.height);
+        for (const auto& child : pattern.node->children) {
+            PaintNode(child,
+                      style_resolver,
+                      geometry_engine,
+                      &pattern_style,
+                      tile_context,
+                      gradients,
+                      patterns,
+                      id_map,
+                      color_profiles,
+                      active_use_ids,
+                      active_pattern_ids,
+                      options,
+                      error);
+            if (error.code != RenderErrorCode::kNone) {
+                break;
+            }
+        }
+        CGContextRestoreGState(tile_context);
+    }
+
+    active_pattern_ids.erase(*pattern_id);
+    if (error.code != RenderErrorCode::kNone) {
+        CGContextRelease(tile_context);
+        return false;
+    }
+
+    CGImageRef tile_image = CGBitmapContextCreateImage(tile_context);
+    CGContextRelease(tile_context);
+    if (tile_image == nullptr) {
+        return false;
+    }
+
+    CGContextSaveGState(context);
+    CGContextAddPath(context, path);
+    CGContextClip(context);
+    CGContextSetAlpha(context, static_cast<CGFloat>(std::clamp(inherited_opacity, 0.0, 1.0)));
+
+    const double start_x = tile_x + std::floor((bbox.origin.x - tile_x) / tile_w) * tile_w;
+    const double start_y = tile_y + std::floor((bbox.origin.y - tile_y) / tile_h) * tile_h;
+    const double end_x = bbox.origin.x + bbox.size.width;
+    const double end_y = bbox.origin.y + bbox.size.height;
+
+    for (double y = start_y; y < end_y + tile_h; y += tile_h) {
+        for (double x = start_x; x < end_x + tile_w; x += tile_w) {
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(x),
+                                           static_cast<CGFloat>(y),
+                                           static_cast<CGFloat>(tile_w),
+                                           static_cast<CGFloat>(tile_h));
+            CGContextSaveGState(context);
+            CGContextTranslateCTM(context, rect.origin.x, rect.origin.y + rect.size.height);
+            CGContextScaleCTM(context, 1.0, -1.0);
+            CGContextDrawImage(context, CGRectMake(0.0, 0.0, rect.size.width, rect.size.height), tile_image);
+            CGContextRestoreGState(context);
+        }
+    }
+
+    CGContextRestoreGState(context);
+    CGImageRelease(tile_image);
+    return true;
+}
+
 void CollectNodesByID(const XmlNode& node, NodeIdMap& id_map) {
     const auto id_it = node.attributes.find("id");
     if (id_it != node.attributes.end() && !id_it->second.empty()) {
@@ -1257,7 +1772,18 @@ void DrawText(CGContextRef context, const ShapeGeometry& geometry, const Resolve
                                                       style.font_family.empty() ? "Helvetica" : style.font_family.c_str(),
                                                       kCFStringEncodingUTF8);
 
-    CTFontRef font = CTFontCreateWithName(font_name, style.font_size > 0.0f ? style.font_size : 16.0f, nullptr);
+    const CGFloat font_size = style.font_size > 0.0f ? style.font_size : 16.0f;
+    CTFontRef font = CTFontCreateWithName(font_name, font_size, nullptr);
+    CTFontRef draw_font = font;
+    if (style.font_weight >= 600) {
+        if (CTFontRef bold_font = CTFontCreateCopyWithSymbolicTraits(font,
+                                                                      font_size,
+                                                                      nullptr,
+                                                                      kCTFontBoldTrait,
+                                                                      kCTFontBoldTrait)) {
+            draw_font = bold_font;
+        }
+    }
 
     CGFloat fill_r = 0.0;
     CGFloat fill_g = 0.0;
@@ -1275,7 +1801,7 @@ void DrawText(CGContextRef context, const ShapeGeometry& geometry, const Resolve
     CGColorRef cg_color = CGColorCreate(cs, components);
 
     CFTypeRef keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-    CFTypeRef values[] = {font, cg_color};
+    CFTypeRef values[] = {draw_font, cg_color};
     CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
                                                reinterpret_cast<const void**>(keys),
                                                reinterpret_cast<const void**>(values),
@@ -1285,10 +1811,26 @@ void DrawText(CGContextRef context, const ShapeGeometry& geometry, const Resolve
 
     CFAttributedStringRef attr_string = CFAttributedStringCreate(kCFAllocatorDefault, text, attrs);
     CTLineRef line = CTLineCreateWithAttributedString(attr_string);
+    const auto anchor = Lower(Trim(style.text_anchor));
+    double line_width = CTLineGetTypographicBounds(line, nullptr, nullptr, nullptr);
+    if (!std::isfinite(line_width)) {
+        line_width = 0.0;
+    }
+    CGFloat anchor_offset = 0.0;
+    if (anchor == "middle") {
+        anchor_offset = static_cast<CGFloat>(-line_width * 0.5);
+    } else if (anchor == "end") {
+        anchor_offset = static_cast<CGFloat>(-line_width);
+    }
 
     CGContextSaveGState(context);
+    // CoreText glyphs are defined in a Y-up text space. Since the renderer
+    // flips the global CTM to SVG's Y-down coordinates, unflip locally for
+    // text so glyphs are not mirrored/inverted.
+    CGContextTranslateCTM(context, static_cast<CGFloat>(geometry.x), static_cast<CGFloat>(geometry.y));
+    CGContextScaleCTM(context, 1.0, -1.0);
     CGContextSetTextMatrix(context, CGAffineTransformIdentity);
-    CGContextSetTextPosition(context, static_cast<CGFloat>(geometry.x), static_cast<CGFloat>(geometry.y));
+    CGContextSetTextPosition(context, anchor_offset, 0.0);
     CTLineDraw(line, context);
     CGContextRestoreGState(context);
 
@@ -1297,6 +1839,9 @@ void DrawText(CGContextRef context, const ShapeGeometry& geometry, const Resolve
     CFRelease(attrs);
     CGColorRelease(cg_color);
     CGColorSpaceRelease(cs);
+    if (draw_font != font) {
+        CFRelease(draw_font);
+    }
     CFRelease(font);
     CFRelease(font_name);
     CFRelease(text);
@@ -1308,8 +1853,11 @@ void PaintNode(const XmlNode& node,
                const ResolvedStyle* parent_style,
                CGContextRef context,
                const GradientMap& gradients,
+               const PatternMap& patterns,
                const NodeIdMap& id_map,
+               const ColorProfileMap& color_profiles,
                std::set<std::string>& active_use_ids,
+               std::set<std::string>& active_pattern_ids,
                const RenderOptions& options,
                RenderError& error) {
     const auto style = style_resolver.Resolve(node, parent_style, options);
@@ -1338,6 +1886,20 @@ void PaintNode(const XmlNode& node,
         return;
     }
 
+    const std::string lower_name = Lower(node.name);
+    // Paint-server/resource nodes define reusable data and must not render directly.
+    if (lower_name == "lineargradient" ||
+        lower_name == "radialgradient" ||
+        lower_name == "stop" ||
+        lower_name == "pattern" ||
+        lower_name == "clippath" ||
+        lower_name == "mask" ||
+        lower_name == "marker" ||
+        lower_name == "color-profile") {
+        CGContextRestoreGState(context);
+        return;
+    }
+
     if (node.name == "use") {
         const auto href_id = ExtractHrefID(node);
         if (href_id.has_value()) {
@@ -1360,8 +1922,11 @@ void PaintNode(const XmlNode& node,
                           &style,
                           context,
                           gradients,
+                          patterns,
                           id_map,
+                          color_profiles,
                           active_use_ids,
+                          active_pattern_ids,
                           options,
                           error);
                 active_use_ids.erase(*href_id);
@@ -1379,8 +1944,11 @@ void PaintNode(const XmlNode& node,
                       &style,
                       context,
                       gradients,
+                      patterns,
                       id_map,
+                      color_profiles,
                       active_use_ids,
+                      active_pattern_ids,
                       options,
                       error);
             if (error.code != RenderErrorCode::kNone) {
@@ -1401,8 +1969,11 @@ void PaintNode(const XmlNode& node,
                       &style,
                       context,
                       gradients,
+                      patterns,
                       id_map,
+                      color_profiles,
                       active_use_ids,
+                      active_pattern_ids,
                       options,
                       error);
             if (error.code != RenderErrorCode::kNone) {
@@ -1450,6 +2021,29 @@ void PaintNode(const XmlNode& node,
             if (geometry->width > 0.0 && geometry->height > 0.0 && !geometry->href.empty()) {
                 CGImageRef image = LoadImageFromHref(geometry->href);
                 if (image != nullptr) {
+                    CGImageRef image_to_draw = image;
+                    CGImageRef transformed = nullptr;
+
+                    if (const auto color_profile_value = ReadAttrOrStyle(node, inline_style, "color-profile");
+                        color_profile_value.has_value()) {
+                        if (const auto profile_ref = ExtractColorProfileReference(*color_profile_value); profile_ref.has_value()) {
+                            auto profile_it = color_profiles.find(*profile_ref);
+                            if (profile_it == color_profiles.end()) {
+                                profile_it = color_profiles.find(Lower(*profile_ref));
+                            }
+                            if (profile_it != color_profiles.end()) {
+                                CGColorSpaceRef source_space = CreateICCColorSpaceFromHref(profile_it->second);
+                                if (source_space != nullptr) {
+                                    transformed = ConvertImageFromAssignedICCProfile(image, source_space);
+                                    CGColorSpaceRelease(source_space);
+                                    if (transformed != nullptr) {
+                                        image_to_draw = transformed;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x),
                                                    static_cast<CGFloat>(geometry->y),
                                                    static_cast<CGFloat>(geometry->width),
@@ -1458,8 +2052,11 @@ void PaintNode(const XmlNode& node,
                     CGContextSetAlpha(context, std::clamp(style.opacity, 0.0f, 1.0f));
                     CGContextTranslateCTM(context, rect.origin.x, rect.origin.y + rect.size.height);
                     CGContextScaleCTM(context, 1.0, -1.0);
-                    CGContextDrawImage(context, CGRectMake(0.0, 0.0, rect.size.width, rect.size.height), image);
+                    CGContextDrawImage(context, CGRectMake(0.0, 0.0, rect.size.width, rect.size.height), image_to_draw);
                     CGContextRestoreGState(context);
+                    if (transformed != nullptr) {
+                        CGImageRelease(transformed);
+                    }
                     CGImageRelease(image);
                 }
             }
@@ -1488,17 +2085,41 @@ void PaintNode(const XmlNode& node,
         const bool has_stroke = style.stroke.is_valid && !style.stroke.is_none;
 
         bool gradient_fill_drawn = false;
+        bool pattern_fill_drawn = false;
         if (path != nullptr) {
             gradient_fill_drawn = PaintGradientFill(context,
                                                     path,
                                                     style,
                                                     gradients,
                                                     static_cast<double>(style.opacity * style.fill_opacity));
+            if (!gradient_fill_drawn) {
+                pattern_fill_drawn = PaintPatternFill(context,
+                                                      path,
+                                                      style,
+                                                      style_resolver,
+                                                      geometry_engine,
+                                                      gradients,
+                                                      patterns,
+                                                      id_map,
+                                                      color_profiles,
+                                                      active_use_ids,
+                                                      active_pattern_ids,
+                                                      options,
+                                                      error,
+                                                      static_cast<double>(style.opacity * style.fill_opacity));
+            }
+            if (error.code != RenderErrorCode::kNone) {
+                if (path != nullptr) {
+                    CGPathRelease(path);
+                }
+                CGContextRestoreGState(context);
+                return;
+            }
         }
 
         const CGPathDrawingMode fill_mode = style.fill_rule == "evenodd" ? kCGPathEOFill : kCGPathFill;
 
-        if (!gradient_fill_drawn && has_fill_color && path != nullptr) {
+        if (!gradient_fill_drawn && !pattern_fill_drawn && has_fill_color && path != nullptr) {
             ApplyColor(context, style.fill, style.opacity * style.fill_opacity, false);
             CGContextBeginPath(context);
             CGContextAddPath(context, path);
@@ -1524,8 +2145,11 @@ void PaintNode(const XmlNode& node,
                   &style,
                   context,
                   gradients,
+                  patterns,
                   id_map,
+                  color_profiles,
                   active_use_ids,
+                  active_pattern_ids,
                   options,
                   error);
         if (error.code != RenderErrorCode::kNone) {
@@ -1557,9 +2181,14 @@ bool PaintEngine::Paint(const SvgDocument& document,
 
     GradientMap gradients;
     CollectGradients(document.root, gradients);
+    PatternMap patterns;
+    CollectPatterns(document.root, patterns);
     NodeIdMap id_map;
     CollectNodesByID(document.root, id_map);
+    ColorProfileMap color_profiles;
+    CollectColorProfiles(document.root, color_profiles);
     std::set<std::string> active_use_ids;
+    std::set<std::string> active_pattern_ids;
 
     CGContextSaveGState(context);
     // SVG uses a top-left origin with positive Y downward.
@@ -1637,8 +2266,11 @@ bool PaintEngine::Paint(const SvgDocument& document,
               nullptr,
               context,
               gradients,
+              patterns,
               id_map,
+              color_profiles,
               active_use_ids,
+              active_pattern_ids,
               options,
               error);
     CGContextRestoreGState(context);

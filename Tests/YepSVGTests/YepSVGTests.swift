@@ -48,6 +48,44 @@ final class YepSVGTests: XCTestCase {
         XCTAssertEqual(Int(image.size.height), 8)
     }
 
+    func testRenderFromFileURLResolvesRelativeImageHref() async throws {
+        let renderer = SVGRenderer()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let sourceImage = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { ctx in
+            UIColor.green.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        }
+        guard let pngData = sourceImage.pngData() else {
+            XCTFail("Failed to generate source PNG")
+            return
+        }
+
+        let imageURL = root.appendingPathComponent("asset.png")
+        try pngData.write(to: imageURL)
+
+        let svg = """
+        <svg width="2" height="2" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+          <image xlink:href="asset.png" x="0" y="0" width="2" height="2"/>
+        </svg>
+        """
+
+        let svgURL = root.appendingPathComponent("fixture.svg")
+        try svg.data(using: .utf8)?.write(to: svgURL)
+
+        let rendered = try await renderer.render(svgFileURL: svgURL, options: .default)
+        guard let cgImage = rendered.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let pixel = try pixelAt(cgImage: cgImage, x: 1, y: 1)
+        XCTAssertLessThan(pixel.r, 80)
+        XCTAssertGreaterThan(pixel.g, 180)
+        XCTAssertLessThan(pixel.b, 80)
+    }
+
     func testExternalResourceBlockedWithoutLoader() async {
         let renderer = SVGRenderer()
         let svg = """
@@ -279,7 +317,402 @@ final class YepSVGTests: XCTestCase {
         XCTAssertLessThan(pixel.b, 40)
     }
 
-    func testInheritedCurrentColorUpdatesWithChildColor() async throws {
+    func testExtendedNamedColorsRenderForW3CColorPropFixture() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="120" height="30" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="15" cy="15" r="10" fill="crimson"/>
+          <circle cx="45" cy="15" r="10" fill="palegreen"/>
+          <circle cx="75" cy="15" r="10" fill="royalblue"/>
+          <circle cx="105" cy="15" r="10" fill="mediumturquoise"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let crimson = try pixelAt(cgImage: cgImage, x: 15, y: 15)
+        XCTAssertGreaterThan(crimson.r, 180)
+        XCTAssertLessThan(crimson.g, 80)
+        XCTAssertLessThan(crimson.b, 120)
+
+        let paleGreen = try pixelAt(cgImage: cgImage, x: 45, y: 15)
+        XCTAssertGreaterThan(paleGreen.g, 220)
+        XCTAssertGreaterThan(paleGreen.r, 120)
+        XCTAssertGreaterThan(paleGreen.b, 120)
+
+        let royalBlue = try pixelAt(cgImage: cgImage, x: 75, y: 15)
+        XCTAssertGreaterThan(royalBlue.b, 180)
+        XCTAssertGreaterThan(royalBlue.r, 40)
+        XCTAssertGreaterThan(royalBlue.g, 60)
+
+        let mediumTurquoise = try pixelAt(cgImage: cgImage, x: 105, y: 15)
+        XCTAssertGreaterThan(mediumTurquoise.g, 180)
+        XCTAssertGreaterThan(mediumTurquoise.b, 160)
+    }
+
+    func testLegacySystemColorKeywordsRenderShapes() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="120" height="60" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="60" height="60" fill="Background"/>
+          <rect x="60" y="0" width="60" height="60" fill="Window"/>
+          <rect x="10" y="10" width="40" height="20" fill="ThreeDFace"/>
+          <text x="68" y="30" fill="WindowText" font-size="14">A</text>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let background = try pixelAt(cgImage: cgImage, x: 5, y: 5)
+        let window = try pixelAt(cgImage: cgImage, x: 90, y: 5)
+        let face = try pixelAt(cgImage: cgImage, x: 20, y: 20)
+
+        XCTAssertGreaterThan(background.b, 80)
+        XCTAssertLessThan(background.r, 80)
+        XCTAssertGreaterThan(window.r, 220)
+        XCTAssertGreaterThan(window.g, 220)
+        XCTAssertGreaterThan(window.b, 220)
+        XCTAssertGreaterThan(face.r, 150)
+        XCTAssertGreaterThan(face.g, 150)
+        XCTAssertGreaterThan(face.b, 150)
+    }
+
+    func testGradientStopCurrentColorUsesGradientColorProperty() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="120" height="20" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="grad" color="red" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stop-color="blue"/>
+              <stop offset="50%" stop-color="currentColor"/>
+              <stop offset="100%" stop-color="yellow"/>
+            </linearGradient>
+          </defs>
+          <rect x="0" y="0" width="120" height="20" fill="url(#grad)"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let midpoint = try pixelAt(cgImage: cgImage, x: 60, y: 10)
+        XCTAssertGreaterThan(midpoint.r, 200)
+        XCTAssertLessThan(midpoint.g, 100)
+        XCTAssertLessThan(midpoint.b, 100)
+    }
+
+    func testCoordsTrans02FixtureWithLegacyCommentBlockParsesAndRenders() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-trans-02-t.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        options.defaultFontSize = 10
+
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+        if let data = image.pngData() {
+            let debugURL = FileManager.default.temporaryDirectory.appendingPathComponent("yepsvg-debug-coords-units-01-b.png")
+            try? data.write(to: debugURL)
+            print("DEBUG coords-units render:", debugURL.path)
+        }
+
+        let hasVisibleContent = try regionHasOpaquePixels(cgImage: cgImage, x: 10, y: 30, width: 460, height: 320)
+        XCTAssertTrue(hasVisibleContent, "Expected coords-trans-02-t fixture to render visible output")
+    }
+
+    func testColorProfFixtureAppliesICCProfileToSecondImage() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/color-prof-01-f.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Top-left sample from first image should stay orange-ish.
+        let firstTopLeft = try pixelAt(cgImage: cgImage, x: 60, y: 30)
+        XCTAssertGreaterThan(firstTopLeft.r, 150)
+        XCTAssertGreaterThan(firstTopLeft.g, 50)
+        XCTAssertLessThan(firstTopLeft.b, 80)
+
+        // Same swatch in second image should be ICC-transformed near primary red.
+        let secondTopLeft = try pixelAt(cgImage: cgImage, x: 290, y: 120)
+        XCTAssertGreaterThan(secondTopLeft.r, 220)
+        XCTAssertLessThan(secondTopLeft.g, 60)
+        XCTAssertLessThan(secondTopLeft.b, 60)
+
+        // Cyan swatch should remain high G/B and near-zero R after transform.
+        let secondCyan = try pixelAt(cgImage: cgImage, x: 290, y: 185)
+        XCTAssertLessThan(secondCyan.r, 40)
+        XCTAssertGreaterThan(secondCyan.g, 220)
+        XCTAssertGreaterThan(secondCyan.b, 220)
+
+        // Ensure transformed second image meaningfully differs from first image.
+        let firstCyan = try pixelAt(cgImage: cgImage, x: 60, y: 95)
+        let channelDelta = abs(Int(firstCyan.r) - Int(secondCyan.r))
+        XCTAssertGreaterThan(channelDelta, 120)
+    }
+
+    func testColorProp04FixtureRendersNonTextShapes() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/color-prop-04-t.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-color-prop-04-t.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        let samplePoints: [(String, Int, Int)] = [
+            ("Background", 12, 12),
+            ("AppWorkspace", 30, 30),
+            ("Window", 330, 280),
+            ("WindowFrame", 88, 180),
+            ("ThreeDFace", 100, 175),
+            ("Menu", 110, 190),
+            ("ThreeDDarkShadow", 207, 200),
+            ("ThreeDLightShadow", 120, 169),
+            ("ActiveCaption", 250, 85),
+            ("ActiveBorder", 92, 90),
+            ("ButtonFace", 374, 94),
+        ]
+
+        let tolerance = 16
+        for (name, x, y) in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: x, y: y)
+            let expected = try pixelAt(cgImage: referenceImage, x: x, y: y)
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)), tolerance, "\(name) red mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)), tolerance, "\(name) green mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)), tolerance, "\(name) blue mismatch @(\(x),\(y))")
+        }
+    }
+
+    func testColorProp04FixtureCaptionTextIsLightAndCentered() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/color-prop-04-t.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Caption text ("Lorem") sits in this strip with fill CaptionText and text-anchor="middle".
+        var brightCount = 0
+        var xAccumulator = 0
+        for y in 68..<112 {
+            for x in 170..<310 {
+                let pixel = try pixelAt(cgImage: cgImage, x: x, y: y)
+                if pixel.a > 120 && pixel.r > 170 && pixel.g > 170 && pixel.b > 170 {
+                    brightCount += 1
+                    xAccumulator += x
+                }
+            }
+        }
+
+        XCTAssertGreaterThan(brightCount, 80, "Expected bright caption glyph pixels")
+        let centerX = Double(xAccumulator) / Double(brightCount)
+        XCTAssertLessThan(abs(centerX - 240.0), 25.0, "Caption text should be centered around x=240")
+    }
+
+    func testCoordsUnits01PatternDefinitionsDoNotRenderAtTopLeft() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-units-01-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Pattern definition content must not leak into document origin space.
+        let leakedPatternPixel = try pixelAt(cgImage: cgImage, x: 25, y: 15)
+        XCTAssertFalse(leakedPatternPixel.r > 180 && leakedPatternPixel.g < 100 && leakedPatternPixel.b < 100,
+                       "Unexpected red pattern leak at top-left origin")
+        XCTAssertFalse(leakedPatternPixel.b > 180 && leakedPatternPixel.r < 120 && leakedPatternPixel.g < 120,
+                       "Unexpected blue pattern leak at top-left origin")
+    }
+
+    func testCoordsUnits01PatternFillsRenderInPercentageFractionAndUserSpaceRects() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-units-01-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let patternRegions: [String: (x: Int, y: Int, width: Int, height: Int)] = [
+            "percentage": (30, 250, 50, 30),
+            "fraction": (180, 250, 50, 30),
+            "user-space": (330, 250, 50, 30),
+        ]
+
+        for (name, region) in patternRegions {
+            let redCount = try countPixels(cgImage: cgImage, x: region.x, y: region.y, width: region.width, height: region.height) { px in
+                px.a > 20 && px.r > 170 && px.g < 120 && px.b < 120
+            }
+            let blueCount = try countPixels(cgImage: cgImage, x: region.x, y: region.y, width: region.width, height: region.height) { px in
+                px.a > 20 && px.b > 170 && px.r < 120 && px.g < 120
+            }
+
+            XCTAssertGreaterThan(redCount, 20, "Expected red pattern content in \(name) region")
+            XCTAssertGreaterThan(blueCount, 20, "Expected blue pattern content in \(name) region")
+        }
+    }
+
+    func testCoordsUnits01PatternOrientationMatchesReferenceSamples() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-units-01-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let percentageRed = try pixelAt(cgImage: cgImage, x: 35, y: 255)
+        let percentageBlue = try pixelAt(cgImage: cgImage, x: 40, y: 255)
+        let fractionRed = try pixelAt(cgImage: cgImage, x: 185, y: 255)
+        let fractionBlue = try pixelAt(cgImage: cgImage, x: 190, y: 255)
+        let userRed = try pixelAt(cgImage: cgImage, x: 340, y: 265)
+        let userBlue = try pixelAt(cgImage: cgImage, x: 340, y: 255)
+
+        let percentageBlueHit = try firstPixelMatching(cgImage: cgImage, x: 30, y: 250, width: 50, height: 30) { px in
+            px.a > 20 && px.b > 150 && px.r < 120 && px.g < 120
+        }
+        let fractionBlueHit = try firstPixelMatching(cgImage: cgImage, x: 180, y: 250, width: 50, height: 30) { px in
+            px.a > 20 && px.b > 150 && px.r < 120 && px.g < 120
+        }
+
+        XCTAssertTrue(percentageRed.r > 160 && percentageRed.b < 140, "Percentage red sample mismatch: \(percentageRed)")
+        XCTAssertTrue(percentageBlue.b > 160 && percentageBlue.r < 140, "Percentage blue sample mismatch: \(percentageBlue), first blue hit: \(String(describing: percentageBlueHit))")
+        XCTAssertTrue(fractionRed.r > 160 && fractionRed.b < 140, "Fraction red sample mismatch: \(fractionRed)")
+        XCTAssertTrue(fractionBlue.b > 160 && fractionBlue.r < 140, "Fraction blue sample mismatch: \(fractionBlue), first blue hit: \(String(describing: fractionBlueHit))")
+        XCTAssertTrue(userRed.r > 160 && userRed.b < 140, "User-space red sample mismatch: \(userRed)")
+        XCTAssertTrue(userBlue.b > 160 && userBlue.r < 140, "User-space blue sample mismatch: \(userBlue)")
+    }
+
+    func testPatternFillKeepsTileOrientation() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="40" height="20" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <pattern id="quad" patternUnits="userSpaceOnUse" patternContentUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+              <rect x="0" y="0" width="10" height="10" fill="#ff0000"/>
+              <rect x="10" y="0" width="10" height="10" fill="#00ff00"/>
+              <rect x="0" y="10" width="10" height="10" fill="#0000ff"/>
+              <rect x="10" y="10" width="10" height="10" fill="#ffff00"/>
+            </pattern>
+          </defs>
+          <rect x="0" y="0" width="40" height="20" fill="url(#quad)"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let topLeft = try pixelAt(cgImage: cgImage, x: 5, y: 5)
+        let topRight = try pixelAt(cgImage: cgImage, x: 15, y: 5)
+        let bottomLeft = try pixelAt(cgImage: cgImage, x: 5, y: 15)
+        let bottomRight = try pixelAt(cgImage: cgImage, x: 15, y: 15)
+
+        XCTAssertGreaterThan(topLeft.r, 200)
+        XCTAssertLessThan(topLeft.g, 80)
+        XCTAssertLessThan(topLeft.b, 80)
+
+        XCTAssertLessThan(topRight.r, 80)
+        XCTAssertGreaterThan(topRight.g, 200)
+        XCTAssertLessThan(topRight.b, 80)
+
+        XCTAssertLessThan(bottomLeft.r, 80)
+        XCTAssertLessThan(bottomLeft.g, 80)
+        XCTAssertGreaterThan(bottomLeft.b, 200)
+
+        XCTAssertGreaterThan(bottomRight.r, 200)
+        XCTAssertGreaterThan(bottomRight.g, 200)
+        XCTAssertLessThan(bottomRight.b, 80)
+    }
+
+    func testPserversPattern01FixturePatternOrientationSamples() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/pservers-pattern-01-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let topRed = try pixelAt(cgImage: cgImage, x: 37, y: 17)
+        XCTAssertGreaterThan(topRed.r, 180)
+        XCTAssertLessThan(topRed.g, 120)
+        XCTAssertLessThan(topRed.b, 120)
+
+        let topGreen = try pixelAt(cgImage: cgImage, x: 43, y: 23)
+        XCTAssertLessThan(topGreen.r, 120)
+        XCTAssertGreaterThan(topGreen.g, 90)
+        XCTAssertLessThan(topGreen.b, 120)
+    }
+
+    func testInheritedCurrentColorKeepsParentComputedFillForChildren() async throws {
         let renderer = SVGRenderer()
         let svg = """
         <svg width="40" height="20" xmlns="http://www.w3.org/2000/svg">
@@ -303,8 +736,99 @@ final class YepSVGTests: XCTestCase {
 
         XCTAssertGreaterThan(left.r, 180)
         XCTAssertLessThan(left.b, 40)
+        XCTAssertGreaterThan(right.r, 180)
+        XCTAssertLessThan(right.b, 40)
+    }
+
+    func testLocalFillCurrentColorUsesElementColor() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="40" height="20" xmlns="http://www.w3.org/2000/svg">
+          <g fill="currentColor" color="#ff0000">
+            <rect x="0" y="0" width="20" height="20"/>
+            <g color="#0000ff">
+              <rect x="20" y="0" width="20" height="20" fill="currentColor"/>
+            </g>
+          </g>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let left = try pixelAt(cgImage: cgImage, x: 10, y: 10)
+        let right = try pixelAt(cgImage: cgImage, x: 30, y: 10)
+
+        XCTAssertGreaterThan(left.r, 180)
+        XCTAssertLessThan(left.b, 40)
         XCTAssertGreaterThan(right.b, 180)
         XCTAssertLessThan(right.r, 40)
+    }
+
+    func testColorProp05FixtureUsesParentCurrentColorComputedFill() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/color-prop-05-t.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let center = try pixelAt(cgImage: cgImage, x: 200, y: 130)
+        XCTAssertGreaterThan(center.r, 220)
+        XCTAssertLessThan(center.g, 40)
+        XCTAssertLessThan(center.b, 40)
+    }
+
+    func testTextAnchorMiddleCentersTextAndFontWeightBoldAddsInk() async throws {
+        let renderer = SVGRenderer()
+
+        let centered = """
+        <svg width="120" height="40" xmlns="http://www.w3.org/2000/svg">
+          <text x="60" y="28" text-anchor="middle" font-size="24" fill="#000">MMMM</text>
+        </svg>
+        """
+        let centeredImage = try await renderer.render(svgString: centered, options: .default)
+        guard let centeredCG = centeredImage.cgImage else {
+            XCTFail("Missing centered CGImage")
+            return
+        }
+        guard let centeredBounds = try opaqueBounds(cgImage: centeredCG) else {
+            XCTFail("Centered text produced no opaque pixels")
+            return
+        }
+        let boundsCenterX = Double(centeredBounds.minX + centeredBounds.maxX) / 2.0
+        XCTAssertLessThan(abs(boundsCenterX - 60.0), 3.0)
+
+        let normal = """
+        <svg width="180" height="50" xmlns="http://www.w3.org/2000/svg">
+          <text x="4" y="34" font-size="32" fill="#000">TEXT</text>
+        </svg>
+        """
+        let bold = """
+        <svg width="180" height="50" xmlns="http://www.w3.org/2000/svg">
+          <text x="4" y="34" font-size="32" font-weight="bold" fill="#000">TEXT</text>
+        </svg>
+        """
+
+        let normalImage = try await renderer.render(svgString: normal, options: .default)
+        let boldImage = try await renderer.render(svgString: bold, options: .default)
+        guard let normalCG = normalImage.cgImage, let boldCG = boldImage.cgImage else {
+            XCTFail("Missing CGImage for normal/bold comparison")
+            return
+        }
+
+        let normalInk = try opaquePixelCount(cgImage: normalCG)
+        let boldInk = try opaquePixelCount(cgImage: boldCG)
+        XCTAssertGreaterThan(boldInk, normalInk + 80, "Bold text should draw more ink than normal text")
     }
 
     func testStrokeLineCapRoundExtendsBeyondLineEndpoints() async throws {
@@ -602,6 +1126,125 @@ final class YepSVGTests: XCTestCase {
             return nil
         }
         return (minX, minY, maxX, maxY)
+    }
+
+    private func opaquePixelCount(cgImage: CGImage) throws -> Int {
+        let imageWidth = cgImage.width
+        let imageHeight = cgImage.height
+        let bytesPerPixel = 4
+        let bytesPerRow = imageWidth * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: imageWidth * imageHeight * bytesPerPixel)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: &data,
+                                      width: imageWidth,
+                                      height: imageHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: bytesPerRow,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw SVGRenderError.renderFailed("Unable to create bitmap context")
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+        var count = 0
+        for i in stride(from: 3, to: data.count, by: 4) {
+            if data[i] > 0 {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    private func countPixels(cgImage: CGImage,
+                             x: Int,
+                             y: Int,
+                             width: Int,
+                             height: Int,
+                             where predicate: ((r: UInt8, g: UInt8, b: UInt8, a: UInt8)) -> Bool) throws -> Int {
+        let imageWidth = cgImage.width
+        let imageHeight = cgImage.height
+        guard x >= 0, y >= 0, x + width <= imageWidth, y + height <= imageHeight else {
+            throw SVGRenderError.renderFailed("Region out of bounds")
+        }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = imageWidth * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: imageWidth * imageHeight * bytesPerPixel)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: &data,
+                                      width: imageWidth,
+                                      height: imageHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: bytesPerRow,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw SVGRenderError.renderFailed("Unable to create bitmap context")
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+
+        var count = 0
+        for yy in y..<(y + height) {
+            for xx in x..<(x + width) {
+                let index = (yy * imageWidth + xx) * bytesPerPixel
+                let pixel = (r: data[index], g: data[index + 1], b: data[index + 2], a: data[index + 3])
+                if predicate(pixel) {
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    private func firstPixelMatching(cgImage: CGImage,
+                                    x: Int,
+                                    y: Int,
+                                    width: Int,
+                                    height: Int,
+                                    where predicate: ((r: UInt8, g: UInt8, b: UInt8, a: UInt8)) -> Bool) throws -> (x: Int, y: Int, rgba: (UInt8, UInt8, UInt8, UInt8))? {
+        let imageWidth = cgImage.width
+        let imageHeight = cgImage.height
+        guard x >= 0, y >= 0, x + width <= imageWidth, y + height <= imageHeight else {
+            throw SVGRenderError.renderFailed("Region out of bounds")
+        }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = imageWidth * bytesPerPixel
+        var data = [UInt8](repeating: 0, count: imageWidth * imageHeight * bytesPerPixel)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: &data,
+                                      width: imageWidth,
+                                      height: imageHeight,
+                                      bitsPerComponent: 8,
+                                      bytesPerRow: bytesPerRow,
+                                      space: colorSpace,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw SVGRenderError.renderFailed("Unable to create bitmap context")
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+
+        for yy in y..<(y + height) {
+            for xx in x..<(x + width) {
+                let index = (yy * imageWidth + xx) * bytesPerPixel
+                let pixel = (r: data[index], g: data[index + 1], b: data[index + 2], a: data[index + 3])
+                if predicate(pixel) {
+                    return (xx, yy, (pixel.r, pixel.g, pixel.b, pixel.a))
+                }
+            }
+        }
+        return nil
+    }
+
+    private func packageRoot() -> URL {
+        let fileURL = URL(fileURLWithPath: #filePath)
+        return fileURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 }
 

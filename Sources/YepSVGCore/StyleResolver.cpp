@@ -7,6 +7,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace csvg {
@@ -197,6 +198,99 @@ Color NamedColor(float r, float g, float b, float a = 1.0f) {
     return color;
 }
 
+std::optional<Color> ParseNamedColor(const std::string& lower) {
+    static const std::unordered_map<std::string, Color> kNamedColors = {
+        {"black", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"white", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"red", NamedColor(1.0f, 0.0f, 0.0f)},
+        {"green", NamedColor(0.0f, 0.5f, 0.0f)},
+        {"blue", NamedColor(0.0f, 0.0f, 1.0f)},
+        {"yellow", NamedColor(1.0f, 1.0f, 0.0f)},
+        {"orange", NamedColor(1.0f, 0.64705884f, 0.0f)},
+        {"purple", NamedColor(0.5f, 0.0f, 0.5f)},
+        {"gray", NamedColor(0.5f, 0.5f, 0.5f)},
+        {"grey", NamedColor(0.5f, 0.5f, 0.5f)},
+        {"cyan", NamedColor(0.0f, 1.0f, 1.0f)},
+        {"aqua", NamedColor(0.0f, 1.0f, 1.0f)},
+        {"magenta", NamedColor(1.0f, 0.0f, 1.0f)},
+        {"fuchsia", NamedColor(1.0f, 0.0f, 1.0f)},
+        {"lime", NamedColor(0.0f, 1.0f, 0.0f)},
+        {"navy", NamedColor(0.0f, 0.0f, 0.5019608f)},
+        {"maroon", NamedColor(0.5019608f, 0.0f, 0.0f)},
+        {"silver", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"gold", NamedColor(1.0f, 0.84313726f, 0.0f)},
+        {"darkblue", NamedColor(0.0f, 0.0f, 0.54509807f)},
+        {"lightblue", NamedColor(0.6784314f, 0.84705883f, 0.9019608f)},
+        {"forestgreen", NamedColor(0.13333334f, 0.54509807f, 0.13333334f)},
+        {"crimson", NamedColor(0.8627451f, 0.078431375f, 0.23529412f)},
+        {"palegreen", NamedColor(0.59607846f, 0.9843137f, 0.59607846f)},
+        {"royalblue", NamedColor(0.25490198f, 0.4117647f, 0.88235295f)},
+        {"firebrick", NamedColor(0.69803923f, 0.13333334f, 0.13333334f)},
+        {"seagreen", NamedColor(0.18039216f, 0.54509807f, 0.34117648f)},
+        {"mediumblue", NamedColor(0.0f, 0.0f, 0.8039216f)},
+        {"indianred", NamedColor(0.8039216f, 0.36078432f, 0.36078432f)},
+        {"lawngreen", NamedColor(0.4862745f, 0.9882353f, 0.0f)},
+        {"mediumturquoise", NamedColor(0.28235295f, 0.81960785f, 0.8f)},
+        // CSS/SVG system color keywords (legacy) used by W3C color-prop fixtures.
+        {"activeborder", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"activecaption", NamedColor(0.0f, 0.0f, 0.5019608f)},
+        {"appworkspace", NamedColor(0.0f, 0.36078432f, 0.36078432f)},
+        {"background", NamedColor(0.0f, 0.36078432f, 0.36078432f)},
+        {"buttonface", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"buttonhighlight", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"buttonshadow", NamedColor(0.627451f, 0.627451f, 0.627451f)},
+        {"buttontext", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"captiontext", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"graytext", NamedColor(0.427451f, 0.427451f, 0.427451f)},
+        {"highlight", NamedColor(0.0f, 0.0f, 0.5019608f)},
+        {"highlighttext", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"inactiveborder", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"inactivecaption", NamedColor(0.5019608f, 0.5019608f, 0.5019608f)},
+        {"inactivecaptiontext", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"infobackground", NamedColor(1.0f, 1.0f, 0.88235295f)},
+        {"infotext", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"menu", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"menutext", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"scrollbar", NamedColor(0.78431374f, 0.78431374f, 0.78431374f)},
+        {"threeddarkshadow", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"threedface", NamedColor(0.7529412f, 0.7529412f, 0.7529412f)},
+        {"threedhighlight", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"threedlightshadow", NamedColor(0.8901961f, 0.8901961f, 0.8901961f)},
+        {"threedshadow", NamedColor(0.627451f, 0.627451f, 0.627451f)},
+        {"window", NamedColor(1.0f, 1.0f, 1.0f)},
+        {"windowframe", NamedColor(0.0f, 0.0f, 0.0f)},
+        {"windowtext", NamedColor(0.0f, 0.0f, 0.0f)},
+    };
+
+    const auto it = kNamedColors.find(lower);
+    if (it == kNamedColors.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+int ParseFontWeight(const std::string& value, int fallback) {
+    const auto trimmed = Lower(Trim(value));
+    if (trimmed.empty()) {
+        return fallback;
+    }
+    if (trimmed == "normal") {
+        return 400;
+    }
+    if (trimmed == "bold" || trimmed == "bolder") {
+        return 700;
+    }
+    if (trimmed == "lighter") {
+        return 300;
+    }
+
+    const auto numeric = ParseCssFloat(trimmed);
+    if (!numeric.has_value()) {
+        return fallback;
+    }
+    return static_cast<int>(std::clamp(*numeric, 1.0f, 1000.0f));
+}
+
 } // namespace
 
 Color StyleResolver::ParseColor(const std::string& value) {
@@ -259,38 +353,8 @@ Color StyleResolver::ParseColor(const std::string& value) {
         return NamedColor(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    if (lower == "black") {
-        return NamedColor(0.0f, 0.0f, 0.0f);
-    }
-    if (lower == "white") {
-        return NamedColor(1.0f, 1.0f, 1.0f);
-    }
-    if (lower == "red") {
-        return NamedColor(1.0f, 0.0f, 0.0f);
-    }
-    if (lower == "green") {
-        return NamedColor(0.0f, 0.5f, 0.0f);
-    }
-    if (lower == "blue") {
-        return NamedColor(0.0f, 0.0f, 1.0f);
-    }
-    if (lower == "yellow") {
-        return NamedColor(1.0f, 1.0f, 0.0f);
-    }
-    if (lower == "orange") {
-        return NamedColor(1.0f, 0.64705884f, 0.0f);
-    }
-    if (lower == "purple") {
-        return NamedColor(0.5f, 0.0f, 0.5f);
-    }
-    if (lower == "gray" || lower == "grey") {
-        return NamedColor(0.5f, 0.5f, 0.5f);
-    }
-    if (lower == "cyan" || lower == "aqua") {
-        return NamedColor(0.0f, 1.0f, 1.0f);
-    }
-    if (lower == "magenta" || lower == "fuchsia") {
-        return NamedColor(1.0f, 0.0f, 1.0f);
+    if (const auto named = ParseNamedColor(lower); named.has_value()) {
+        return *named;
     }
 
     return {};
@@ -340,6 +404,8 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
 
         style.font_family = options.default_font_family;
         style.font_size = options.default_font_size;
+        style.font_weight = 400;
+        style.text_anchor = "start";
     }
 
     const auto style_it = node.attributes.find("style");
@@ -359,7 +425,10 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
 
     const auto color = read_value("color");
     const auto fill = read_value("fill");
+    const bool has_local_fill = fill.has_value();
     const auto fill_rule = read_value("fill-rule");
+    const auto stroke = read_value("stroke");
+    const bool has_local_stroke = stroke.has_value();
 
     if (color.has_value()) {
         style.color_paint = Trim(*color);
@@ -372,7 +441,7 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
         style.fill_paint = Trim(*fill);
         style.fill = ParseColor(*fill);
     }
-    if (const auto stroke = read_value("stroke"); stroke.has_value()) {
+    if (stroke.has_value()) {
         style.stroke_paint = Trim(*stroke);
         style.stroke = ParseColor(*stroke);
     }
@@ -412,17 +481,26 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
     if (const auto font_size = read_value("font-size"); font_size.has_value()) {
         style.font_size = ParseFloat(*font_size, style.font_size);
     }
+    if (const auto font_weight = read_value("font-weight"); font_weight.has_value()) {
+        style.font_weight = ParseFontWeight(*font_weight, style.font_weight);
+    }
+    if (const auto text_anchor = read_value("text-anchor"); text_anchor.has_value()) {
+        const auto anchor = Lower(Trim(*text_anchor));
+        if (anchor == "start" || anchor == "middle" || anchor == "end") {
+            style.text_anchor = anchor;
+        }
+    }
 
     style.fill_opacity = std::clamp(style.fill_opacity, 0.0f, 1.0f);
     style.stroke_opacity = std::clamp(style.stroke_opacity, 0.0f, 1.0f);
     style.opacity = std::clamp(style.opacity, 0.0f, 1.0f);
 
-    if (Lower(Trim(style.fill_paint)) == "currentcolor") {
+    if (has_local_fill && Lower(Trim(style.fill_paint)) == "currentcolor") {
         style.fill = style.color;
         style.fill.is_none = false;
         style.fill.is_valid = true;
     }
-    if (Lower(Trim(style.stroke_paint)) == "currentcolor") {
+    if (has_local_stroke && Lower(Trim(style.stroke_paint)) == "currentcolor") {
         style.stroke = style.color;
         style.stroke.is_none = false;
         style.stroke.is_valid = true;

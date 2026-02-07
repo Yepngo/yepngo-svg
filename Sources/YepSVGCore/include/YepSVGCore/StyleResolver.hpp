@@ -32,6 +32,8 @@ struct ResolvedStyle {
 
     std::string font_family;
     float font_size = 0.0f;
+    int font_weight = 400;
+    std::string text_anchor = "start";
 };
 
 class StyleResolver {
