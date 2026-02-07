@@ -23,9 +23,11 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: YepSVGSampleApp/App
-    resources:
       - path: YepSVGSampleApp/Resources/badge.svg
-        type: file
+        buildPhase: resources
+      - path: YepSVGSampleApp/Resources/W3CSuite
+        buildPhase: resources
+        type: folder
     dependencies:
       - package: YepSVG
         product: YepSVG
