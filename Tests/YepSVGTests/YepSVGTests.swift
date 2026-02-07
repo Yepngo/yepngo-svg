@@ -643,6 +643,114 @@ final class YepSVGTests: XCTestCase {
         XCTAssertTrue(userBlue.b > 160 && userBlue.r < 140, "User-space blue sample mismatch: \(userBlue)")
     }
 
+    func testCoordsUnits02FixturePercentageAndCssUnitConversionsMatchReference() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-units-02-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Percentage coordinate marker should overlap the black marker center.
+        let percentMarker = try pixelAt(cgImage: cgImage, x: 35, y: 80)
+        XCTAssertGreaterThan(percentMarker.r, 180)
+        XCTAssertLessThan(percentMarker.g, 80)
+        XCTAssertLessThan(percentMarker.b, 80)
+
+        // Percentage width/height rectangle should match the red control marker block.
+        let percentRect = try pixelAt(cgImage: cgImage, x: 32, y: 197)
+        XCTAssertGreaterThan(percentRect.r, 180)
+        XCTAssertLessThan(percentRect.g, 80)
+        XCTAssertLessThan(percentRect.b, 80)
+
+        // Percentage radius should produce a green circle with comparable radius.
+        let greenMid = try pixelAt(cgImage: cgImage, x: 122, y: 260)
+        XCTAssertGreaterThan(greenMid.g, 90)
+        XCTAssertLessThan(greenMid.r, 90)
+        XCTAssertLessThan(greenMid.b, 90)
+        let greenOutside = try pixelAt(cgImage: cgImage, x: 126, y: 260)
+        XCTAssertLessThan(greenOutside.a, 30)
+    }
+
+    func testCoordsViewattr01FixtureParsesDoctypeEntitiesAndRenders() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-viewattr-01-b.svg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        // Left smile from expanded &Smile; entity.
+        let leftSmile = try pixelAt(cgImage: cgImage, x: 35, y: 90)
+        XCTAssertGreaterThan(leftSmile.r, 200)
+        XCTAssertGreaterThan(leftSmile.g, 200)
+        XCTAssertLessThan(leftSmile.b, 80)
+
+        // Smile inside nested <svg> in meet-group.
+        let nestedSmile = try pixelAt(cgImage: cgImage, x: 131, y: 91)
+        XCTAssertGreaterThan(nestedSmile.r, 200)
+        XCTAssertGreaterThan(nestedSmile.g, 200)
+        XCTAssertLessThan(nestedSmile.b, 80)
+    }
+
+    func testCoordsViewattr02FixtureImagePreserveAspectRatioMatchesReference() async throws {
+        let root = packageRoot()
+        let fixture = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/svggen/coords-viewattr-02-b.svg")
+        let reference = root.appendingPathComponent("Examples/YepSVGSampleApp/YepSVGSampleApp/Resources/W3CSuite/png/full-coords-viewattr-02-b.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reference.path))
+
+        let renderer = SVGRenderer()
+        var options = SVGRenderOptions.default
+        options.viewportSize = CGSize(width: 480, height: 360)
+        let image = try await renderer.render(svgFileURL: fixture, options: options)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+        guard let referenceImage = UIImage(contentsOfFile: reference.path)?.cgImage else {
+            XCTFail("Failed to load reference PNG")
+            return
+        }
+
+        // Centers of each preserveAspectRatio sample viewport.
+        let samplePoints: [(String, Int, Int)] = [
+            ("source-none", 40, 90),
+            ("meet-xMin", 145, 95),
+            ("meet-xMid", 215, 95),
+            ("meet-xMax", 145, 145),
+            ("meet-YMin", 315, 110),
+            ("meet-YMid", 365, 110),
+            ("meet-YMax", 415, 110),
+            ("slice-xMin", 135, 245),
+            ("slice-xMid", 185, 245),
+            ("slice-xMax", 235, 245),
+            ("slice-YMin", 325, 230),
+            ("slice-YMid", 395, 230),
+            ("slice-YMax", 325, 280),
+        ]
+        let tolerance = 20
+        for (name, x, y) in samplePoints {
+            let actual = try pixelAt(cgImage: cgImage, x: x, y: y)
+            let expected = try pixelAt(cgImage: referenceImage, x: x, y: y)
+            XCTAssertLessThanOrEqual(abs(Int(actual.r) - Int(expected.r)), tolerance, "\(name) red mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.g) - Int(expected.g)), tolerance, "\(name) green mismatch @(\(x),\(y))")
+            XCTAssertLessThanOrEqual(abs(Int(actual.b) - Int(expected.b)), tolerance, "\(name) blue mismatch @(\(x),\(y))")
+        }
+    }
+
     func testPatternFillKeepsTileOrientation() async throws {
         let renderer = SVGRenderer()
         let svg = """

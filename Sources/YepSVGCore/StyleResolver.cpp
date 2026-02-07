@@ -45,6 +45,56 @@ float ParseFloat(const std::string& value, float fallback) {
     return parsed;
 }
 
+float ConvertAbsoluteLength(float value, const std::string& unit) {
+    if (unit.empty() || unit == "px") {
+        return value;
+    }
+    if (unit == "pt") {
+        return value * (96.0f / 72.0f);
+    }
+    if (unit == "pc") {
+        return value * 16.0f;
+    }
+    if (unit == "in") {
+        return value * 96.0f;
+    }
+    if (unit == "cm") {
+        return value * (96.0f / 2.54f);
+    }
+    if (unit == "mm") {
+        return value * (96.0f / 25.4f);
+    }
+    if (unit == "q") {
+        return value * (96.0f / 101.6f);
+    }
+    return value;
+}
+
+float ParseLength(const std::string& value, float fallback, float percent_basis) {
+    const auto trimmed = Trim(value);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const float parsed = std::strtof(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return fallback;
+    }
+
+    const auto unit = Lower(Trim(std::string(end_ptr)));
+    if (unit == "%") {
+        return parsed * 0.01f * percent_basis;
+    }
+    if (unit == "em") {
+        return parsed * percent_basis;
+    }
+    if (unit == "ex") {
+        return parsed * percent_basis * 0.5f;
+    }
+    return ConvertAbsoluteLength(parsed, unit);
+}
+
 std::map<std::string, std::string> ParseInlineStyle(const std::string& style_text) {
     std::map<std::string, std::string> out;
     std::stringstream stream(style_text);
@@ -452,7 +502,7 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
         style.stroke_opacity = ParseFloat(*stroke_opacity, style.stroke_opacity);
     }
     if (const auto stroke_width = read_value("stroke-width"); stroke_width.has_value()) {
-        style.stroke_width = ParseFloat(*stroke_width, style.stroke_width);
+        style.stroke_width = ParseLength(*stroke_width, style.stroke_width, style.font_size);
     }
     if (const auto opacity = read_value("opacity"); opacity.has_value()) {
         style.opacity = ParseFloat(*opacity, style.opacity);
@@ -473,13 +523,13 @@ ResolvedStyle StyleResolver::Resolve(const XmlNode& node, const ResolvedStyle* p
         style.stroke_dasharray = ParseFloatList(*stroke_dasharray);
     }
     if (const auto stroke_dashoffset = read_value("stroke-dashoffset"); stroke_dashoffset.has_value()) {
-        style.stroke_dashoffset = ParseFloat(*stroke_dashoffset, style.stroke_dashoffset);
+        style.stroke_dashoffset = ParseLength(*stroke_dashoffset, style.stroke_dashoffset, style.font_size);
     }
     if (const auto font_family = read_value("font-family"); font_family.has_value()) {
         style.font_family = *font_family;
     }
     if (const auto font_size = read_value("font-size"); font_size.has_value()) {
-        style.font_size = ParseFloat(*font_size, style.font_size);
+        style.font_size = ParseLength(*font_size, style.font_size, style.font_size);
     }
     if (const auto font_weight = read_value("font-weight"); font_weight.has_value()) {
         style.font_weight = ParseFontWeight(*font_weight, style.font_weight);

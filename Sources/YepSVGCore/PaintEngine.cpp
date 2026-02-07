@@ -635,6 +635,228 @@ double ParseDouble(const std::string& raw, double fallback) {
     return parsed;
 }
 
+enum class SvgLengthAxis {
+    kX,
+    kY,
+    kDiagonal,
+};
+
+double NormalizeViewportDiagonal(double width, double height) {
+    if (width <= 0.0 || height <= 0.0) {
+        return 100.0;
+    }
+    return std::sqrt((width * width + height * height) / 2.0);
+}
+
+double PercentLengthBasis(SvgLengthAxis axis, double viewport_width, double viewport_height) {
+    switch (axis) {
+        case SvgLengthAxis::kX:
+            return viewport_width > 0.0 ? viewport_width : 100.0;
+        case SvgLengthAxis::kY:
+            return viewport_height > 0.0 ? viewport_height : 100.0;
+        case SvgLengthAxis::kDiagonal:
+            return NormalizeViewportDiagonal(viewport_width, viewport_height);
+    }
+    return 100.0;
+}
+
+double ConvertLengthToPixels(double value, const std::string& unit) {
+    if (unit.empty() || unit == "px") {
+        return value;
+    }
+    if (unit == "pt") {
+        return value * (96.0 / 72.0);
+    }
+    if (unit == "pc") {
+        return value * 16.0;
+    }
+    if (unit == "in") {
+        return value * 96.0;
+    }
+    if (unit == "cm") {
+        return value * (96.0 / 2.54);
+    }
+    if (unit == "mm") {
+        return value * (96.0 / 25.4);
+    }
+    if (unit == "q") {
+        return value * (96.0 / 101.6);
+    }
+    return value;
+}
+
+double ParseSVGLength(const std::string& raw,
+                      double fallback,
+                      SvgLengthAxis axis,
+                      double viewport_width,
+                      double viewport_height) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return fallback;
+    }
+
+    const std::string suffix = Lower(Trim(std::string(end_ptr)));
+    if (suffix == "%") {
+        const double basis = PercentLengthBasis(axis, viewport_width, viewport_height);
+        return (parsed / 100.0) * basis;
+    }
+    return ConvertLengthToPixels(parsed, suffix);
+}
+
+double ParseSVGLengthAttr(const std::map<std::string, std::string>& attributes,
+                          const std::string& key,
+                          double fallback,
+                          SvgLengthAxis axis,
+                          double viewport_width,
+                          double viewport_height) {
+    const auto it = attributes.find(key);
+    if (it == attributes.end()) {
+        return fallback;
+    }
+    return ParseSVGLength(it->second, fallback, axis, viewport_width, viewport_height);
+}
+
+bool ParseViewBoxValue(const std::string& raw,
+                       double& view_box_x,
+                       double& view_box_y,
+                       double& view_box_width,
+                       double& view_box_height) {
+    std::string normalized = raw;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+
+    std::stringstream parser(normalized);
+    if (!(parser >> view_box_x >> view_box_y >> view_box_width >> view_box_height)) {
+        return false;
+    }
+    return view_box_width > 0.0 && view_box_height > 0.0;
+}
+
+CGAffineTransform ComputeViewBoxTransform(double viewport_width,
+                                          double viewport_height,
+                                          double view_box_x,
+                                          double view_box_y,
+                                          double view_box_width,
+                                          double view_box_height,
+                                          const std::string& preserve_raw) {
+    const double scale_x = viewport_width / view_box_width;
+    const double scale_y = viewport_height / view_box_height;
+
+    std::string preserve_value = Lower(Trim(preserve_raw));
+    if (preserve_value.empty()) {
+        preserve_value = "xmidymid meet";
+    }
+
+    double final_scale_x = scale_x;
+    double final_scale_y = scale_y;
+    double translate_x = -view_box_x * scale_x;
+    double translate_y = -view_box_y * scale_y;
+
+    if (preserve_value != "none") {
+        std::stringstream parser(preserve_value);
+        std::string align = "xmidymid";
+        std::string meet_or_slice = "meet";
+        parser >> align >> meet_or_slice;
+        if (align == "defer") {
+            parser >> align >> meet_or_slice;
+        }
+        if (align.empty()) {
+            align = "xmidymid";
+        }
+        if (meet_or_slice != "slice") {
+            meet_or_slice = "meet";
+        }
+
+        const double uniform_scale = meet_or_slice == "slice"
+            ? std::max(scale_x, scale_y)
+            : std::min(scale_x, scale_y);
+        final_scale_x = uniform_scale;
+        final_scale_y = uniform_scale;
+
+        const double content_width = view_box_width * uniform_scale;
+        const double content_height = view_box_height * uniform_scale;
+        const double extra_x = viewport_width - content_width;
+        const double extra_y = viewport_height - content_height;
+
+        double align_x = 0.0;
+        double align_y = 0.0;
+        if (align.find("xmid") != std::string::npos) {
+            align_x = extra_x * 0.5;
+        } else if (align.find("xmax") != std::string::npos) {
+            align_x = extra_x;
+        }
+        if (align.find("ymid") != std::string::npos) {
+            align_y = extra_y * 0.5;
+        } else if (align.find("ymax") != std::string::npos) {
+            align_y = extra_y;
+        }
+
+        translate_x = align_x - (view_box_x * uniform_scale);
+        translate_y = align_y - (view_box_y * uniform_scale);
+    }
+
+    return CGAffineTransformMake(static_cast<CGFloat>(final_scale_x),
+                                 0.0,
+                                 0.0,
+                                 static_cast<CGFloat>(final_scale_y),
+                                 static_cast<CGFloat>(translate_x),
+                                 static_cast<CGFloat>(translate_y));
+}
+
+struct PreserveAspectRatioSpec {
+    bool none = false;
+    bool slice = false;
+    double align_x = 0.5;
+    double align_y = 0.5;
+};
+
+PreserveAspectRatioSpec ParsePreserveAspectRatioSpec(const std::string& preserve_raw) {
+    PreserveAspectRatioSpec spec;
+    std::string preserve_value = Lower(Trim(preserve_raw));
+    if (preserve_value.empty()) {
+        preserve_value = "xmidymid meet";
+    }
+
+    std::stringstream parser(preserve_value);
+    std::string align = "xmidymid";
+    std::string meet_or_slice = "meet";
+    parser >> align >> meet_or_slice;
+    if (align == "defer") {
+        parser >> align >> meet_or_slice;
+    }
+    if (align.empty()) {
+        align = "xmidymid";
+    }
+
+    if (align == "none") {
+        spec.none = true;
+        spec.slice = false;
+        spec.align_x = 0.0;
+        spec.align_y = 0.0;
+        return spec;
+    }
+
+    spec.slice = meet_or_slice == "slice";
+    spec.align_x = 0.0;
+    spec.align_y = 0.0;
+    if (align.find("xmid") != std::string::npos) {
+        spec.align_x = 0.5;
+    } else if (align.find("xmax") != std::string::npos) {
+        spec.align_x = 1.0;
+    }
+    if (align.find("ymid") != std::string::npos) {
+        spec.align_y = 0.5;
+    } else if (align.find("ymax") != std::string::npos) {
+        spec.align_y = 1.0;
+    }
+    return spec;
+}
+
 bool IsHexDigit(char c) {
     return (c >= '0' && c <= '9') ||
            (c >= 'a' && c <= 'f') ||
@@ -1905,14 +2127,20 @@ void PaintNode(const XmlNode& node,
         if (href_id.has_value()) {
             const auto target_it = id_map.find(*href_id);
             if (target_it != id_map.end() && active_use_ids.find(*href_id) == active_use_ids.end()) {
-                double x = 0.0;
-                double y = 0.0;
-                if (const auto x_it = node.attributes.find("x"); x_it != node.attributes.end()) {
-                    x = ParseDouble(x_it->second, 0.0);
-                }
-                if (const auto y_it = node.attributes.find("y"); y_it != node.attributes.end()) {
-                    y = ParseDouble(y_it->second, 0.0);
-                }
+                const double viewport_width = geometry_engine.viewport_width();
+                const double viewport_height = geometry_engine.viewport_height();
+                const double x = ParseSVGLengthAttr(node.attributes,
+                                                    "x",
+                                                    0.0,
+                                                    SvgLengthAxis::kX,
+                                                    viewport_width,
+                                                    viewport_height);
+                const double y = ParseSVGLengthAttr(node.attributes,
+                                                    "y",
+                                                    0.0,
+                                                    SvgLengthAxis::kY,
+                                                    viewport_width,
+                                                    viewport_height);
 
                 CGContextTranslateCTM(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
                 active_use_ids.insert(*href_id);
@@ -1936,7 +2164,125 @@ void PaintNode(const XmlNode& node,
         return;
     }
 
-    if (node.name == "svg" || node.name == "g" || node.name == "symbol") {
+    if (node.name == "svg") {
+        if (parent_style != nullptr) {
+            const double parent_viewport_width = geometry_engine.viewport_width();
+            const double parent_viewport_height = geometry_engine.viewport_height();
+
+            const double viewport_x = ParseSVGLengthAttr(node.attributes,
+                                                         "x",
+                                                         0.0,
+                                                         SvgLengthAxis::kX,
+                                                         parent_viewport_width,
+                                                         parent_viewport_height);
+            const double viewport_y = ParseSVGLengthAttr(node.attributes,
+                                                         "y",
+                                                         0.0,
+                                                         SvgLengthAxis::kY,
+                                                         parent_viewport_width,
+                                                         parent_viewport_height);
+            const double viewport_width_default = parent_viewport_width > 0.0 ? parent_viewport_width : 100.0;
+            const double viewport_height_default = parent_viewport_height > 0.0 ? parent_viewport_height : 100.0;
+            const double viewport_width = ParseSVGLengthAttr(node.attributes,
+                                                             "width",
+                                                             viewport_width_default,
+                                                             SvgLengthAxis::kX,
+                                                             parent_viewport_width,
+                                                             parent_viewport_height);
+            const double viewport_height = ParseSVGLengthAttr(node.attributes,
+                                                              "height",
+                                                              viewport_height_default,
+                                                              SvgLengthAxis::kY,
+                                                              parent_viewport_width,
+                                                              parent_viewport_height);
+
+            if (!(viewport_width > 0.0) || !(viewport_height > 0.0)) {
+                CGContextRestoreGState(context);
+                return;
+            }
+
+            CGContextTranslateCTM(context, static_cast<CGFloat>(viewport_x), static_cast<CGFloat>(viewport_y));
+            CGContextBeginPath(context);
+            CGContextAddRect(context,
+                             CGRectMake(0.0,
+                                        0.0,
+                                        static_cast<CGFloat>(viewport_width),
+                                        static_cast<CGFloat>(viewport_height)));
+            CGContextClip(context);
+
+            double child_viewport_width = viewport_width;
+            double child_viewport_height = viewport_height;
+            if (const auto view_box_it = node.attributes.find("viewBox"); view_box_it != node.attributes.end()) {
+                double view_box_x = 0.0;
+                double view_box_y = 0.0;
+                double view_box_width = 0.0;
+                double view_box_height = 0.0;
+                if (ParseViewBoxValue(view_box_it->second,
+                                      view_box_x,
+                                      view_box_y,
+                                      view_box_width,
+                                      view_box_height)) {
+                    const auto preserve_it = node.attributes.find("preserveAspectRatio");
+                    const std::string preserve_value = preserve_it != node.attributes.end() ? preserve_it->second : "";
+                    CGContextConcatCTM(context,
+                                       ComputeViewBoxTransform(viewport_width,
+                                                               viewport_height,
+                                                               view_box_x,
+                                                               view_box_y,
+                                                               view_box_width,
+                                                               view_box_height,
+                                                               preserve_value));
+                    child_viewport_width = view_box_width;
+                    child_viewport_height = view_box_height;
+                }
+            }
+
+            const GeometryEngine child_geometry_engine(child_viewport_width, child_viewport_height);
+            for (const auto& child : node.children) {
+                PaintNode(child,
+                          style_resolver,
+                          child_geometry_engine,
+                          &style,
+                          context,
+                          gradients,
+                          patterns,
+                          id_map,
+                          color_profiles,
+                          active_use_ids,
+                          active_pattern_ids,
+                          options,
+                          error);
+                if (error.code != RenderErrorCode::kNone) {
+                    CGContextRestoreGState(context);
+                    return;
+                }
+            }
+        } else {
+            for (const auto& child : node.children) {
+                PaintNode(child,
+                          style_resolver,
+                          geometry_engine,
+                          &style,
+                          context,
+                          gradients,
+                          patterns,
+                          id_map,
+                          color_profiles,
+                          active_use_ids,
+                          active_pattern_ids,
+                          options,
+                          error);
+                if (error.code != RenderErrorCode::kNone) {
+                    CGContextRestoreGState(context);
+                    return;
+                }
+            }
+        }
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    if (node.name == "g" || node.name == "symbol") {
         for (const auto& child : node.children) {
             PaintNode(child,
                       style_resolver,
@@ -2048,11 +2394,42 @@ void PaintNode(const XmlNode& node,
                                                    static_cast<CGFloat>(geometry->y),
                                                    static_cast<CGFloat>(geometry->width),
                                                    static_cast<CGFloat>(geometry->height));
+                    CGRect draw_rect = rect;
+                    bool clip_to_viewport = false;
+                    const auto preserve_it = node.attributes.find("preserveAspectRatio");
+                    const PreserveAspectRatioSpec preserve = ParsePreserveAspectRatioSpec(
+                        preserve_it != node.attributes.end() ? preserve_it->second : "");
+                    const double image_width = static_cast<double>(CGImageGetWidth(image_to_draw));
+                    const double image_height = static_cast<double>(CGImageGetHeight(image_to_draw));
+                    if (!preserve.none && image_width > 0.0 && image_height > 0.0) {
+                        const double scale_x = static_cast<double>(rect.size.width) / image_width;
+                        const double scale_y = static_cast<double>(rect.size.height) / image_height;
+                        const double uniform_scale = preserve.slice
+                            ? std::max(scale_x, scale_y)
+                            : std::min(scale_x, scale_y);
+                        const double draw_width = image_width * uniform_scale;
+                        const double draw_height = image_height * uniform_scale;
+                        const double offset_x = (static_cast<double>(rect.size.width) - draw_width) * preserve.align_x;
+                        const double offset_y = (static_cast<double>(rect.size.height) - draw_height) * preserve.align_y;
+                        draw_rect = CGRectMake(rect.origin.x + static_cast<CGFloat>(offset_x),
+                                               rect.origin.y + static_cast<CGFloat>(offset_y),
+                                               static_cast<CGFloat>(draw_width),
+                                               static_cast<CGFloat>(draw_height));
+                        clip_to_viewport = preserve.slice;
+                    }
+
                     CGContextSaveGState(context);
                     CGContextSetAlpha(context, std::clamp(style.opacity, 0.0f, 1.0f));
-                    CGContextTranslateCTM(context, rect.origin.x, rect.origin.y + rect.size.height);
+                    if (clip_to_viewport) {
+                        CGContextBeginPath(context);
+                        CGContextAddRect(context, rect);
+                        CGContextClip(context);
+                    }
+                    CGContextTranslateCTM(context, draw_rect.origin.x, draw_rect.origin.y + draw_rect.size.height);
                     CGContextScaleCTM(context, 1.0, -1.0);
-                    CGContextDrawImage(context, CGRectMake(0.0, 0.0, rect.size.width, rect.size.height), image_to_draw);
+                    CGContextDrawImage(context,
+                                       CGRectMake(0.0, 0.0, draw_rect.size.width, draw_rect.size.height),
+                                       image_to_draw);
                     CGContextRestoreGState(context);
                     if (transformed != nullptr) {
                         CGImageRelease(transformed);
@@ -2177,7 +2554,7 @@ bool PaintEngine::Paint(const SvgDocument& document,
     }
 
     const StyleResolver style_resolver;
-    const GeometryEngine geometry_engine;
+    const GeometryEngine geometry_engine(layout.view_box_width, layout.view_box_height);
 
     GradientMap gradients;
     CollectGradients(document.root, gradients);
@@ -2196,67 +2573,15 @@ bool PaintEngine::Paint(const SvgDocument& document,
     CGContextScaleCTM(context, 1.0, -1.0);
 
     if (layout.view_box_width > 0.0 && layout.view_box_height > 0.0) {
-        const double scale_x = static_cast<double>(layout.width) / layout.view_box_width;
-        const double scale_y = static_cast<double>(layout.height) / layout.view_box_height;
         const auto preserve_it = document.root.attributes.find("preserveAspectRatio");
-        const std::string preserve_value = preserve_it != document.root.attributes.end()
-            ? Lower(Trim(preserve_it->second))
-            : "xmidymid meet";
-
-        double final_scale_x = scale_x;
-        double final_scale_y = scale_y;
-        double translate_x = -layout.view_box_x * scale_x;
-        double translate_y = -layout.view_box_y * scale_y;
-
-        if (preserve_value != "none") {
-            std::stringstream parser(preserve_value);
-            std::string align = "xmidymid";
-            std::string meet_or_slice = "meet";
-            parser >> align >> meet_or_slice;
-            if (align == "defer") {
-                parser >> align >> meet_or_slice;
-            }
-            if (align.empty()) {
-                align = "xmidymid";
-            }
-            if (meet_or_slice != "slice") {
-                meet_or_slice = "meet";
-            }
-
-            const double uniform_scale = meet_or_slice == "slice"
-                ? std::max(scale_x, scale_y)
-                : std::min(scale_x, scale_y);
-            final_scale_x = uniform_scale;
-            final_scale_y = uniform_scale;
-
-            const double content_width = layout.view_box_width * uniform_scale;
-            const double content_height = layout.view_box_height * uniform_scale;
-            const double extra_x = static_cast<double>(layout.width) - content_width;
-            const double extra_y = static_cast<double>(layout.height) - content_height;
-
-            double align_x = 0.0;
-            double align_y = 0.0;
-            if (align.find("xmid") != std::string::npos) {
-                align_x = extra_x * 0.5;
-            } else if (align.find("xmax") != std::string::npos) {
-                align_x = extra_x;
-            }
-            if (align.find("ymid") != std::string::npos) {
-                align_y = extra_y * 0.5;
-            } else if (align.find("ymax") != std::string::npos) {
-                align_y = extra_y;
-            }
-
-            translate_x = align_x - (layout.view_box_x * uniform_scale);
-            translate_y = align_y - (layout.view_box_y * uniform_scale);
-        }
-
-        const CGAffineTransform viewbox_transform = CGAffineTransformMake(static_cast<CGFloat>(final_scale_x),
-                                                                          0.0,
-                                                                          0.0,
-                                                                          static_cast<CGFloat>(final_scale_y),
-                                                                          static_cast<CGFloat>(translate_x),
-                                                                          static_cast<CGFloat>(translate_y));
+        const std::string preserve_value = preserve_it != document.root.attributes.end() ? preserve_it->second : "";
+        const CGAffineTransform viewbox_transform = ComputeViewBoxTransform(static_cast<double>(layout.width),
+                                                                            static_cast<double>(layout.height),
+                                                                            layout.view_box_x,
+                                                                            layout.view_box_y,
+                                                                            layout.view_box_width,
+                                                                            layout.view_box_height,
+                                                                            preserve_value);
         CGContextConcatCTM(context, viewbox_transform);
     }
 

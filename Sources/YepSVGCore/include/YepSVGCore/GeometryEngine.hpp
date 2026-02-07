@@ -38,8 +38,15 @@ struct ShapeGeometry {
 
 class GeometryEngine {
 public:
+    GeometryEngine(double viewport_width = 0.0, double viewport_height = 0.0);
+    double viewport_width() const;
+    double viewport_height() const;
     std::optional<ShapeGeometry> Build(const XmlNode& node) const;
     static std::vector<Point> ParsePointList(const std::string& value);
+
+private:
+    double viewport_width_ = 0.0;
+    double viewport_height_ = 0.0;
 };
 
 } // namespace csvg
