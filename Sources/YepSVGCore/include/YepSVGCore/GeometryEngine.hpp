@@ -19,6 +19,7 @@ enum class ShapeType {
     kPolygon,
     kPolyline,
     kText,
+    kImage,
 };
 
 struct ShapeGeometry {
@@ -32,6 +33,7 @@ struct ShapeGeometry {
     std::vector<Point> points;
     std::string path_data;
     std::string text;
+    std::string href;
 };
 
 class GeometryEngine {

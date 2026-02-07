@@ -124,6 +124,24 @@ std::optional<ShapeGeometry> GeometryEngine::Build(const XmlNode& node) const {
         return geometry;
     }
 
+    if (node.name == "image") {
+        geometry.type = ShapeType::kImage;
+        geometry.x = ParseNumber(node.attributes, "x");
+        geometry.y = ParseNumber(node.attributes, "y");
+        geometry.width = ParseNumber(node.attributes, "width");
+        geometry.height = ParseNumber(node.attributes, "height");
+        const auto href_it = node.attributes.find("href");
+        if (href_it != node.attributes.end()) {
+            geometry.href = href_it->second;
+        } else {
+            const auto xlink_href_it = node.attributes.find("xlink:href");
+            if (xlink_href_it != node.attributes.end()) {
+                geometry.href = xlink_href_it->second;
+            }
+        }
+        return geometry;
+    }
+
     return std::nullopt;
 }
 

@@ -393,6 +393,112 @@ final class YepSVGTests: XCTestCase {
         XCTAssertLessThan(inside.b, 40)
     }
 
+    func testUseElementRendersReferencedShapeWithOffset() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="32" height="20" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <circle id="dot" cx="4" cy="4" r="4" fill="#ff0000"/>
+          </defs>
+          <use href="#dot" x="10" y="6"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let movedCenter = try pixelAt(cgImage: cgImage, x: 14, y: 10)
+        XCTAssertGreaterThan(movedCenter.r, 200)
+        XCTAssertLessThan(movedCenter.g, 40)
+        XCTAssertLessThan(movedCenter.b, 40)
+
+        let originalDefsLocation = try pixelAt(cgImage: cgImage, x: 4, y: 4)
+        XCTAssertLessThan(originalDefsLocation.a, 10, "Definitions should not render directly")
+    }
+
+    func testDisplayNoneSkipsElement() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="20" height="20" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="20" height="20" fill="#ff0000" style="display:none;"/>
+          <rect x="10" y="0" width="10" height="20" fill="#0000ff"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let left = try pixelAt(cgImage: cgImage, x: 4, y: 10)
+        let right = try pixelAt(cgImage: cgImage, x: 15, y: 10)
+
+        XCTAssertLessThan(left.a, 10)
+        XCTAssertGreaterThan(right.b, 180)
+        XCTAssertLessThan(right.r, 40)
+    }
+
+    func testImageDataURLRendersAndPreservesOrientation() async throws {
+        let sourceImage = UIGraphicsImageRenderer(size: CGSize(width: 2, height: 2)).image { ctx in
+            UIColor.red.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 2, height: 1))
+            UIColor.blue.setFill()
+            ctx.fill(CGRect(x: 0, y: 1, width: 2, height: 1))
+        }
+        guard let pngData = sourceImage.pngData() else {
+            XCTFail("Failed to generate source PNG")
+            return
+        }
+        let href = "data:image/png;base64,\(pngData.base64EncodedString())"
+        let svg = """
+        <svg width="2" height="2" xmlns="http://www.w3.org/2000/svg">
+          <image href="\(href)" x="0" y="0" width="2" height="2"/>
+        </svg>
+        """
+
+        let renderer = SVGRenderer()
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let top = try pixelAt(cgImage: cgImage, x: 1, y: 0)
+        let bottom = try pixelAt(cgImage: cgImage, x: 1, y: 1)
+
+        XCTAssertGreaterThan(top.r, 180)
+        XCTAssertLessThan(top.b, 80)
+        XCTAssertGreaterThan(bottom.b, 180)
+        XCTAssertLessThan(bottom.r, 80)
+    }
+
+    func testDefaultPreserveAspectRatioCentersViewBoxContent() async throws {
+        let renderer = SVGRenderer()
+        let svg = """
+        <svg width="200" height="100" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="100" height="100" fill="#ff0000"/>
+        </svg>
+        """
+
+        let image = try await renderer.render(svgString: svg, options: .default)
+        guard let cgImage = image.cgImage else {
+            XCTFail("Missing CGImage")
+            return
+        }
+
+        let leftBar = try pixelAt(cgImage: cgImage, x: 10, y: 50)
+        let centered = try pixelAt(cgImage: cgImage, x: 100, y: 50)
+        let rightBar = try pixelAt(cgImage: cgImage, x: 190, y: 50)
+
+        XCTAssertLessThan(leftBar.a, 10)
+        XCTAssertGreaterThan(centered.r, 180)
+        XCTAssertLessThan(rightBar.a, 10)
+    }
+
     private func pixelAt(cgImage: CGImage, x: Int, y: Int) throws -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
         let width = cgImage.width
         let height = cgImage.height

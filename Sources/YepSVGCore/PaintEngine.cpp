@@ -1,11 +1,13 @@
 #include "YepSVGCore/PaintEngine.hpp"
 
+#include <ImageIO/ImageIO.h>
 #include <CoreText/CoreText.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <set>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -47,6 +49,7 @@ struct GradientDefinition {
 };
 
 using GradientMap = std::map<std::string, GradientDefinition>;
+using NodeIdMap = std::map<std::string, const XmlNode*>;
 
 std::string Trim(const std::string& value) {
     const auto begin = value.find_first_not_of(" \t\r\n");
@@ -617,6 +620,198 @@ double ParseDouble(const std::string& raw, double fallback) {
     return parsed;
 }
 
+bool IsHexDigit(char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+uint8_t HexValue(char c) {
+    if (c >= '0' && c <= '9') {
+        return static_cast<uint8_t>(c - '0');
+    }
+    if (c >= 'a' && c <= 'f') {
+        return static_cast<uint8_t>(10 + (c - 'a'));
+    }
+    return static_cast<uint8_t>(10 + (c - 'A'));
+}
+
+std::string PercentDecode(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if (c == '%' && i + 2 < value.size() && IsHexDigit(value[i + 1]) && IsHexDigit(value[i + 2])) {
+            const auto high = HexValue(value[i + 1]);
+            const auto low = HexValue(value[i + 2]);
+            decoded.push_back(static_cast<char>((high << 4) | low));
+            i += 2;
+        } else if (c == '+') {
+            decoded.push_back(' ');
+        } else {
+            decoded.push_back(c);
+        }
+    }
+    return decoded;
+}
+
+std::optional<std::vector<uint8_t>> DecodeBase64(const std::string& input) {
+    static const int8_t kLookup[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+        -1,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+
+    std::vector<uint8_t> output;
+    output.reserve((input.size() * 3) / 4);
+
+    int32_t buffer = 0;
+    int bits_collected = 0;
+    for (unsigned char c : input) {
+        const int8_t code = kLookup[c];
+        if (code == -1) {
+            if (std::isspace(c) != 0) {
+                continue;
+            }
+            return std::nullopt;
+        }
+        if (code == -2) {
+            break;
+        }
+        buffer = (buffer << 6) | code;
+        bits_collected += 6;
+        if (bits_collected >= 8) {
+            bits_collected -= 8;
+            output.push_back(static_cast<uint8_t>((buffer >> bits_collected) & 0xFF));
+        }
+    }
+    return output;
+}
+
+std::optional<std::vector<uint8_t>> DecodeDataURL(const std::string& href) {
+    if (href.rfind("data:", 0) != 0) {
+        return std::nullopt;
+    }
+
+    const auto comma = href.find(',');
+    if (comma == std::string::npos || comma <= 5) {
+        return std::nullopt;
+    }
+
+    const std::string metadata = Lower(href.substr(5, comma - 5));
+    const std::string payload = href.substr(comma + 1);
+    const bool is_base64 = metadata.find(";base64") != std::string::npos;
+    if (is_base64) {
+        return DecodeBase64(payload);
+    }
+
+    const auto decoded = PercentDecode(payload);
+    return std::vector<uint8_t>(decoded.begin(), decoded.end());
+}
+
+CGImageRef CreateImageFromData(const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) {
+        return nullptr;
+    }
+
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes.data(), static_cast<CFIndex>(bytes.size()));
+    if (data == nullptr) {
+        return nullptr;
+    }
+
+    CGImageSourceRef source = CGImageSourceCreateWithData(data, nullptr);
+    CFRelease(data);
+    if (source == nullptr) {
+        return nullptr;
+    }
+
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    return image;
+}
+
+CGImageRef LoadImageFromHref(const std::string& raw_href) {
+    const auto href = Trim(raw_href);
+    if (href.empty()) {
+        return nullptr;
+    }
+
+    if (href.rfind("data:", 0) == 0) {
+        const auto bytes = DecodeDataURL(href);
+        if (!bytes.has_value()) {
+            return nullptr;
+        }
+        return CreateImageFromData(*bytes);
+    }
+
+    if (href.rfind("file://", 0) == 0) {
+        CFURLRef url = CFURLCreateWithBytes(kCFAllocatorDefault,
+                                            reinterpret_cast<const UInt8*>(href.data()),
+                                            static_cast<CFIndex>(href.size()),
+                                            kCFStringEncodingUTF8,
+                                            nullptr);
+        if (url == nullptr) {
+            return nullptr;
+        }
+        CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+        CFRelease(url);
+        if (source == nullptr) {
+            return nullptr;
+        }
+        CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+        CFRelease(source);
+        return image;
+    }
+
+    if (href.rfind("http://", 0) == 0 || href.rfind("https://", 0) == 0) {
+        return nullptr;
+    }
+
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault,
+                                                            reinterpret_cast<const UInt8*>(href.data()),
+                                                            static_cast<CFIndex>(href.size()),
+                                                            false);
+    if (url == nullptr) {
+        return nullptr;
+    }
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+    CFRelease(url);
+    if (source == nullptr) {
+        return nullptr;
+    }
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    return image;
+}
+
+std::optional<std::string> ExtractHrefID(const XmlNode& node) {
+    const auto href_it = node.attributes.find("href");
+    const auto xlink_href_it = node.attributes.find("xlink:href");
+    std::string value;
+    if (href_it != node.attributes.end()) {
+        value = Trim(href_it->second);
+    } else if (xlink_href_it != node.attributes.end()) {
+        value = Trim(xlink_href_it->second);
+    }
+    if (value.empty() || value.front() != '#' || value.size() < 2) {
+        return std::nullopt;
+    }
+    return value.substr(1);
+}
+
 CGAffineTransform ParseTransformList(const std::string& raw) {
     CGAffineTransform transform = CGAffineTransformIdentity;
     size_t i = 0;
@@ -970,6 +1165,88 @@ bool PaintGradientFill(CGContextRef context,
     return true;
 }
 
+void CollectNodesByID(const XmlNode& node, NodeIdMap& id_map) {
+    const auto id_it = node.attributes.find("id");
+    if (id_it != node.attributes.end() && !id_it->second.empty()) {
+        id_map.emplace(id_it->second, &node);
+    }
+    for (const auto& child : node.children) {
+        CollectNodesByID(child, id_map);
+    }
+}
+
+bool AddGeometryPath(CGContextRef context, const ShapeGeometry& geometry) {
+    switch (geometry.type) {
+        case ShapeType::kRect: {
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry.x),
+                                           static_cast<CGFloat>(geometry.y),
+                                           static_cast<CGFloat>(geometry.width),
+                                           static_cast<CGFloat>(geometry.height));
+            if (geometry.rx > 0.0 || geometry.ry > 0.0) {
+                const CGFloat radius = static_cast<CGFloat>(std::max(geometry.rx, geometry.ry));
+                const CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, nullptr);
+                CGContextAddPath(context, path);
+                CGPathRelease(path);
+            } else {
+                CGContextAddRect(context, rect);
+            }
+            return true;
+        }
+        case ShapeType::kCircle: {
+            const double radius = geometry.rx;
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry.x - radius),
+                                           static_cast<CGFloat>(geometry.y - radius),
+                                           static_cast<CGFloat>(radius * 2.0),
+                                           static_cast<CGFloat>(radius * 2.0));
+            CGContextAddEllipseInRect(context, rect);
+            return true;
+        }
+        case ShapeType::kEllipse: {
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry.x - geometry.rx),
+                                           static_cast<CGFloat>(geometry.y - geometry.ry),
+                                           static_cast<CGFloat>(geometry.rx * 2.0),
+                                           static_cast<CGFloat>(geometry.ry * 2.0));
+            CGContextAddEllipseInRect(context, rect);
+            return true;
+        }
+        case ShapeType::kLine: {
+            if (geometry.points.size() >= 2) {
+                CGContextMoveToPoint(context,
+                                     static_cast<CGFloat>(geometry.points[0].x),
+                                     static_cast<CGFloat>(geometry.points[0].y));
+                CGContextAddLineToPoint(context,
+                                        static_cast<CGFloat>(geometry.points[1].x),
+                                        static_cast<CGFloat>(geometry.points[1].y));
+            }
+            return true;
+        }
+        case ShapeType::kPolygon:
+        case ShapeType::kPolyline: {
+            if (!geometry.points.empty()) {
+                CGContextMoveToPoint(context,
+                                     static_cast<CGFloat>(geometry.points[0].x),
+                                     static_cast<CGFloat>(geometry.points[0].y));
+                for (size_t i = 1; i < geometry.points.size(); ++i) {
+                    CGContextAddLineToPoint(context,
+                                            static_cast<CGFloat>(geometry.points[i].x),
+                                            static_cast<CGFloat>(geometry.points[i].y));
+                }
+                if (geometry.type == ShapeType::kPolygon) {
+                    CGContextClosePath(context);
+                }
+            }
+            return true;
+        }
+        case ShapeType::kPath:
+            BuildPathFromData(context, geometry.path_data);
+            return true;
+        case ShapeType::kText:
+        case ShapeType::kImage:
+        case ShapeType::kUnknown:
+            return false;
+    }
+}
+
 void DrawText(CGContextRef context, const ShapeGeometry& geometry, const ResolvedStyle& style) {
     if (geometry.text.empty()) {
         return;
@@ -1031,9 +1308,24 @@ void PaintNode(const XmlNode& node,
                const ResolvedStyle* parent_style,
                CGContextRef context,
                const GradientMap& gradients,
+               const NodeIdMap& id_map,
+               std::set<std::string>& active_use_ids,
                const RenderOptions& options,
                RenderError& error) {
     const auto style = style_resolver.Resolve(node, parent_style, options);
+    const auto style_it = node.attributes.find("style");
+    const auto inline_style = style_it != node.attributes.end() ? ParseInlineStyle(style_it->second) : std::map<std::string, std::string>{};
+
+    if (const auto display = ReadAttrOrStyle(node, inline_style, "display");
+        display.has_value() && Lower(Trim(*display)) == "none") {
+        return;
+    }
+    if (const auto visibility = ReadAttrOrStyle(node, inline_style, "visibility"); visibility.has_value()) {
+        const auto visibility_value = Lower(Trim(*visibility));
+        if (visibility_value == "hidden" || visibility_value == "collapse") {
+            return;
+        }
+    }
 
     CGContextSaveGState(context);
     const auto transform_it = node.attributes.find("transform");
@@ -1046,9 +1338,51 @@ void PaintNode(const XmlNode& node,
         return;
     }
 
-    if (node.name == "svg" || node.name == "g") {
+    if (node.name == "use") {
+        const auto href_id = ExtractHrefID(node);
+        if (href_id.has_value()) {
+            const auto target_it = id_map.find(*href_id);
+            if (target_it != id_map.end() && active_use_ids.find(*href_id) == active_use_ids.end()) {
+                double x = 0.0;
+                double y = 0.0;
+                if (const auto x_it = node.attributes.find("x"); x_it != node.attributes.end()) {
+                    x = ParseDouble(x_it->second, 0.0);
+                }
+                if (const auto y_it = node.attributes.find("y"); y_it != node.attributes.end()) {
+                    y = ParseDouble(y_it->second, 0.0);
+                }
+
+                CGContextTranslateCTM(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+                active_use_ids.insert(*href_id);
+                PaintNode(*target_it->second,
+                          style_resolver,
+                          geometry_engine,
+                          &style,
+                          context,
+                          gradients,
+                          id_map,
+                          active_use_ids,
+                          options,
+                          error);
+                active_use_ids.erase(*href_id);
+            }
+        }
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    if (node.name == "svg" || node.name == "g" || node.name == "symbol") {
         for (const auto& child : node.children) {
-            PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+            PaintNode(child,
+                      style_resolver,
+                      geometry_engine,
+                      &style,
+                      context,
+                      gradients,
+                      id_map,
+                      active_use_ids,
+                      options,
+                      error);
             if (error.code != RenderErrorCode::kNone) {
                 CGContextRestoreGState(context);
                 return;
@@ -1061,7 +1395,16 @@ void PaintNode(const XmlNode& node,
     auto geometry = geometry_engine.Build(node);
     if (!geometry.has_value()) {
         for (const auto& child : node.children) {
-            PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+            PaintNode(child,
+                      style_resolver,
+                      geometry_engine,
+                      &style,
+                      context,
+                      gradients,
+                      id_map,
+                      active_use_ids,
+                      options,
+                      error);
             if (error.code != RenderErrorCode::kNone) {
                 CGContextRestoreGState(context);
                 return;
@@ -1100,79 +1443,42 @@ void PaintNode(const XmlNode& node,
     }
 
     switch (geometry->type) {
-        case ShapeType::kRect: {
-            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x),
-                                           static_cast<CGFloat>(geometry->y),
-                                           static_cast<CGFloat>(geometry->width),
-                                           static_cast<CGFloat>(geometry->height));
-            if (geometry->rx > 0.0 || geometry->ry > 0.0) {
-                const CGFloat radius = static_cast<CGFloat>(std::max(geometry->rx, geometry->ry));
-                const CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, nullptr);
-                CGContextAddPath(context, path);
-                CGPathRelease(path);
-            } else {
-                CGContextAddRect(context, rect);
-            }
-            break;
-        }
-        case ShapeType::kCircle: {
-            const double radius = geometry->rx;
-            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x - radius),
-                                           static_cast<CGFloat>(geometry->y - radius),
-                                           static_cast<CGFloat>(radius * 2.0),
-                                           static_cast<CGFloat>(radius * 2.0));
-            CGContextAddEllipseInRect(context, rect);
-            break;
-        }
-        case ShapeType::kEllipse: {
-            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x - geometry->rx),
-                                           static_cast<CGFloat>(geometry->y - geometry->ry),
-                                           static_cast<CGFloat>(geometry->rx * 2.0),
-                                           static_cast<CGFloat>(geometry->ry * 2.0));
-            CGContextAddEllipseInRect(context, rect);
-            break;
-        }
-        case ShapeType::kLine: {
-            if (geometry->points.size() >= 2) {
-                CGContextMoveToPoint(context,
-                                     static_cast<CGFloat>(geometry->points[0].x),
-                                     static_cast<CGFloat>(geometry->points[0].y));
-                CGContextAddLineToPoint(context,
-                                        static_cast<CGFloat>(geometry->points[1].x),
-                                        static_cast<CGFloat>(geometry->points[1].y));
-            }
-            break;
-        }
-        case ShapeType::kPolygon:
-        case ShapeType::kPolyline: {
-            if (!geometry->points.empty()) {
-                CGContextMoveToPoint(context,
-                                     static_cast<CGFloat>(geometry->points[0].x),
-                                     static_cast<CGFloat>(geometry->points[0].y));
-                for (size_t i = 1; i < geometry->points.size(); ++i) {
-                    CGContextAddLineToPoint(context,
-                                            static_cast<CGFloat>(geometry->points[i].x),
-                                            static_cast<CGFloat>(geometry->points[i].y));
-                }
-                if (geometry->type == ShapeType::kPolygon) {
-                    CGContextClosePath(context);
-                }
-            }
-            break;
-        }
-        case ShapeType::kPath: {
-            BuildPathFromData(context, geometry->path_data);
-            break;
-        }
-        case ShapeType::kText: {
+        case ShapeType::kText:
             DrawText(context, *geometry, style);
             break;
+        case ShapeType::kImage: {
+            if (geometry->width > 0.0 && geometry->height > 0.0 && !geometry->href.empty()) {
+                CGImageRef image = LoadImageFromHref(geometry->href);
+                if (image != nullptr) {
+                    const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x),
+                                                   static_cast<CGFloat>(geometry->y),
+                                                   static_cast<CGFloat>(geometry->width),
+                                                   static_cast<CGFloat>(geometry->height));
+                    CGContextSaveGState(context);
+                    CGContextSetAlpha(context, std::clamp(style.opacity, 0.0f, 1.0f));
+                    CGContextTranslateCTM(context, rect.origin.x, rect.origin.y + rect.size.height);
+                    CGContextScaleCTM(context, 1.0, -1.0);
+                    CGContextDrawImage(context, CGRectMake(0.0, 0.0, rect.size.width, rect.size.height), image);
+                    CGContextRestoreGState(context);
+                    CGImageRelease(image);
+                }
+            }
+            break;
         }
+        case ShapeType::kRect:
+        case ShapeType::kCircle:
+        case ShapeType::kEllipse:
+        case ShapeType::kLine:
+        case ShapeType::kPath:
+        case ShapeType::kPolygon:
+        case ShapeType::kPolyline:
+            AddGeometryPath(context, *geometry);
+            break;
         case ShapeType::kUnknown:
             break;
     }
 
-    if (geometry->type != ShapeType::kText) {
+    if (geometry->type != ShapeType::kText && geometry->type != ShapeType::kImage) {
         CGPathRef path = CGContextCopyPath(context);
         if (path != nullptr) {
             CGContextBeginPath(context);
@@ -1212,7 +1518,16 @@ void PaintNode(const XmlNode& node,
     }
 
     for (const auto& child : node.children) {
-        PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+        PaintNode(child,
+                  style_resolver,
+                  geometry_engine,
+                  &style,
+                  context,
+                  gradients,
+                  id_map,
+                  active_use_ids,
+                  options,
+                  error);
         if (error.code != RenderErrorCode::kNone) {
             CGContextRestoreGState(context);
             return;
@@ -1242,6 +1557,9 @@ bool PaintEngine::Paint(const SvgDocument& document,
 
     GradientMap gradients;
     CollectGradients(document.root, gradients);
+    NodeIdMap id_map;
+    CollectNodesByID(document.root, id_map);
+    std::set<std::string> active_use_ids;
 
     CGContextSaveGState(context);
     // SVG uses a top-left origin with positive Y downward.
@@ -1251,17 +1569,78 @@ bool PaintEngine::Paint(const SvgDocument& document,
     if (layout.view_box_width > 0.0 && layout.view_box_height > 0.0) {
         const double scale_x = static_cast<double>(layout.width) / layout.view_box_width;
         const double scale_y = static_cast<double>(layout.height) / layout.view_box_height;
+        const auto preserve_it = document.root.attributes.find("preserveAspectRatio");
+        const std::string preserve_value = preserve_it != document.root.attributes.end()
+            ? Lower(Trim(preserve_it->second))
+            : "xmidymid meet";
 
-        const CGAffineTransform viewbox_transform = CGAffineTransformMake(static_cast<CGFloat>(scale_x),
+        double final_scale_x = scale_x;
+        double final_scale_y = scale_y;
+        double translate_x = -layout.view_box_x * scale_x;
+        double translate_y = -layout.view_box_y * scale_y;
+
+        if (preserve_value != "none") {
+            std::stringstream parser(preserve_value);
+            std::string align = "xmidymid";
+            std::string meet_or_slice = "meet";
+            parser >> align >> meet_or_slice;
+            if (align == "defer") {
+                parser >> align >> meet_or_slice;
+            }
+            if (align.empty()) {
+                align = "xmidymid";
+            }
+            if (meet_or_slice != "slice") {
+                meet_or_slice = "meet";
+            }
+
+            const double uniform_scale = meet_or_slice == "slice"
+                ? std::max(scale_x, scale_y)
+                : std::min(scale_x, scale_y);
+            final_scale_x = uniform_scale;
+            final_scale_y = uniform_scale;
+
+            const double content_width = layout.view_box_width * uniform_scale;
+            const double content_height = layout.view_box_height * uniform_scale;
+            const double extra_x = static_cast<double>(layout.width) - content_width;
+            const double extra_y = static_cast<double>(layout.height) - content_height;
+
+            double align_x = 0.0;
+            double align_y = 0.0;
+            if (align.find("xmid") != std::string::npos) {
+                align_x = extra_x * 0.5;
+            } else if (align.find("xmax") != std::string::npos) {
+                align_x = extra_x;
+            }
+            if (align.find("ymid") != std::string::npos) {
+                align_y = extra_y * 0.5;
+            } else if (align.find("ymax") != std::string::npos) {
+                align_y = extra_y;
+            }
+
+            translate_x = align_x - (layout.view_box_x * uniform_scale);
+            translate_y = align_y - (layout.view_box_y * uniform_scale);
+        }
+
+        const CGAffineTransform viewbox_transform = CGAffineTransformMake(static_cast<CGFloat>(final_scale_x),
                                                                           0.0,
                                                                           0.0,
-                                                                          static_cast<CGFloat>(scale_y),
-                                                                          static_cast<CGFloat>(-layout.view_box_x * scale_x),
-                                                                          static_cast<CGFloat>(-layout.view_box_y * scale_y));
+                                                                          static_cast<CGFloat>(final_scale_y),
+                                                                          static_cast<CGFloat>(translate_x),
+                                                                          static_cast<CGFloat>(translate_y));
         CGContextConcatCTM(context, viewbox_transform);
     }
 
-    PaintNode(document.root, style_resolver, geometry_engine, nullptr, context, gradients, options, error);
+    PaintNode(document.root,
+              style_resolver,
+              geometry_engine,
+              nullptr,
+              context,
+              gradients,
+              id_map,
+              active_use_ids,
+              options,
+              error);
     CGContextRestoreGState(context);
     return error.code == RenderErrorCode::kNone;
 }
