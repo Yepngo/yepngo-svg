@@ -1,0 +1,350 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2D24EC5AD8A3C91B1BA06398 /* YepSVG in Frameworks */ = {isa = PBXBuildFile; productRef = C47C4344B7FA69D3DA7B940D /* YepSVG */; };
+		2F87FEA15F3E9349CB5E7457 /* YepSVGSampleApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB2B0DE486AF04418A67E31 /* YepSVGSampleApp.swift */; };
+		46E56C8838F69F9796F8CBCD /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E81E98DC94C1855C25C46DB /* ContentView.swift */; };
+		C7EC0D48E2D74AE028A3520B /* BundledBadgeSVG.swift in Sources */ = {isa = PBXBuildFile; fileRef = B693DF1DA25CD23440D06F50 /* BundledBadgeSVG.swift */; };
+		CC7731954AA8D39A2AA1C5DF /* BasicBadgeSVG.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627FBD0177C1852C50F373CC /* BasicBadgeSVG.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1AB2B0DE486AF04418A67E31 /* YepSVGSampleApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YepSVGSampleApp.swift; sourceTree = "<group>"; };
+		5E81E98DC94C1855C25C46DB /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		627FBD0177C1852C50F373CC /* BasicBadgeSVG.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BasicBadgeSVG.swift; sourceTree = "<group>"; };
+		9346390E46F7625597DF0E98 /* YepSVGSampleApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = YepSVGSampleApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B693DF1DA25CD23440D06F50 /* BundledBadgeSVG.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundledBadgeSVG.swift; sourceTree = "<group>"; };
+		BD642969E4F96865167410B7 /* yepngo-svg */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "yepngo-svg"; path = ../..; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B03BC03B786B0D2A183A2DB7 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2D24EC5AD8A3C91B1BA06398 /* YepSVG in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		56675F9823F682F39A42A708 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				BD642969E4F96865167410B7 /* yepngo-svg */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		A63D4B148D28B67BD0A42887 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				627FBD0177C1852C50F373CC /* BasicBadgeSVG.swift */,
+				B693DF1DA25CD23440D06F50 /* BundledBadgeSVG.swift */,
+				5E81E98DC94C1855C25C46DB /* ContentView.swift */,
+				1AB2B0DE486AF04418A67E31 /* YepSVGSampleApp.swift */,
+			);
+			name = App;
+			path = YepSVGSampleApp/App;
+			sourceTree = "<group>";
+		};
+		BCE4536B4C19FC1D5C88EDE4 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				9346390E46F7625597DF0E98 /* YepSVGSampleApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DFDFC05B8B7C1B5096711861 = {
+			isa = PBXGroup;
+			children = (
+				A63D4B148D28B67BD0A42887 /* App */,
+				56675F9823F682F39A42A708 /* Packages */,
+				BCE4536B4C19FC1D5C88EDE4 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		C8C2DD34AFF429038DD756F4 /* YepSVGSampleApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3AFA6A3520BC4DDAF1987CB9 /* Build configuration list for PBXNativeTarget "YepSVGSampleApp" */;
+			buildPhases = (
+				284758D596A52369D88CF211 /* Sources */,
+				B03BC03B786B0D2A183A2DB7 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YepSVGSampleApp;
+			packageProductDependencies = (
+				C47C4344B7FA69D3DA7B940D /* YepSVG */,
+			);
+			productName = YepSVGSampleApp;
+			productReference = 9346390E46F7625597DF0E98 /* YepSVGSampleApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1FAC055FEAA24AFA1A129779 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					C8C2DD34AFF429038DD756F4 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 3C94EF2DAA5FDDD6179C4B8D /* Build configuration list for PBXProject "YepSVGSampleApp" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = DFDFC05B8B7C1B5096711861;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				54F2D7D4B73B975AFF1987E4 /* XCLocalSwiftPackageReference "../.." */,
+			);
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C8C2DD34AFF429038DD756F4 /* YepSVGSampleApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		284758D596A52369D88CF211 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CC7731954AA8D39A2AA1C5DF /* BasicBadgeSVG.swift in Sources */,
+				C7EC0D48E2D74AE028A3520B /* BundledBadgeSVG.swift in Sources */,
+				46E56C8838F69F9796F8CBCD /* ContentView.swift in Sources */,
+				2F87FEA15F3E9349CB5E7457 /* YepSVGSampleApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		21C44133A67FDF5BB86B83F2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		21F409CA90C7E68CBDB464DB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.yepngo.YepSVGSampleApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		61129FF5C64AB544A8772109 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.yepngo.YepSVGSampleApp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		71CD68BEBAEAEC0C298954AB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3AFA6A3520BC4DDAF1987CB9 /* Build configuration list for PBXNativeTarget "YepSVGSampleApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				21C44133A67FDF5BB86B83F2 /* Debug */,
+				71CD68BEBAEAEC0C298954AB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		3C94EF2DAA5FDDD6179C4B8D /* Build configuration list for PBXProject "YepSVGSampleApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				61129FF5C64AB544A8772109 /* Debug */,
+				21F409CA90C7E68CBDB464DB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		54F2D7D4B73B975AFF1987E4 /* XCLocalSwiftPackageReference "../.." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C47C4344B7FA69D3DA7B940D /* YepSVG */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YepSVG;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 1FAC055FEAA24AFA1A129779 /* Project object */;
+}

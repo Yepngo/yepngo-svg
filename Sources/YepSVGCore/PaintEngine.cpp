@@ -1,0 +1,1269 @@
+#include "YepSVGCore/PaintEngine.hpp"
+
+#include <CoreText/CoreText.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <map>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace csvg {
+namespace {
+
+struct GradientStop {
+    double offset = 0.0;
+    Color color;
+    double opacity = 1.0;
+};
+
+enum class GradientType {
+    kLinear,
+    kRadial,
+};
+
+struct GradientDefinition {
+    GradientType type = GradientType::kLinear;
+    std::string id;
+    bool user_space_units = false;
+    CGAffineTransform transform = CGAffineTransformIdentity;
+
+    double x1 = 0.0;
+    double y1 = 0.0;
+    double x2 = 1.0;
+    double y2 = 0.0;
+
+    double cx = 0.5;
+    double cy = 0.5;
+    double r = 0.5;
+    double fx = 0.5;
+    double fy = 0.5;
+
+    std::vector<GradientStop> stops;
+};
+
+using GradientMap = std::map<std::string, GradientDefinition>;
+
+std::string Trim(const std::string& value) {
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return "";
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+std::string Lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+bool IsNumberStart(char c) {
+    return std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' || c == '.';
+}
+
+void SkipPathDelimiters(const std::string& text, size_t& index) {
+    while (index < text.size()) {
+        const char c = text[index];
+        if (std::isspace(static_cast<unsigned char>(c)) || c == ',') {
+            ++index;
+            continue;
+        }
+        break;
+    }
+}
+
+bool ParsePathNumber(const std::string& text, size_t& index, double& out) {
+    SkipPathDelimiters(text, index);
+    if (index >= text.size()) {
+        return false;
+    }
+
+    const char* start = text.c_str() + index;
+    char* end_ptr = nullptr;
+    out = std::strtod(start, &end_ptr);
+    if (end_ptr == start) {
+        return false;
+    }
+    index = static_cast<size_t>(end_ptr - text.c_str());
+    return true;
+}
+
+bool HasMorePathNumbers(const std::string& text, size_t index) {
+    SkipPathDelimiters(text, index);
+    if (index >= text.size()) {
+        return false;
+    }
+    return IsNumberStart(text[index]);
+}
+
+constexpr double kArcEpsilon = 1e-9;
+
+bool NearlyEqual(double a, double b) {
+    return std::fabs(a - b) <= kArcEpsilon;
+}
+
+double SignedVectorAngle(double ux, double uy, double vx, double vy) {
+    return std::atan2((ux * vy) - (uy * vx), (ux * vx) + (uy * vy));
+}
+
+CGPoint MapUnitArcPoint(double ux,
+                        double uy,
+                        double cx,
+                        double cy,
+                        double rx,
+                        double ry,
+                        double cos_phi,
+                        double sin_phi) {
+    const double x = cx + (rx * ux * cos_phi) - (ry * uy * sin_phi);
+    const double y = cy + (rx * ux * sin_phi) + (ry * uy * cos_phi);
+    return CGPointMake(static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+}
+
+void AddArcAsBezier(CGContextRef context,
+                    double x1,
+                    double y1,
+                    double rx,
+                    double ry,
+                    double x_axis_rotation_degrees,
+                    bool large_arc_flag,
+                    bool sweep_flag,
+                    double x2,
+                    double y2) {
+    if (NearlyEqual(x1, x2) && NearlyEqual(y1, y2)) {
+        return;
+    }
+
+    rx = std::fabs(rx);
+    ry = std::fabs(ry);
+    if (rx < kArcEpsilon || ry < kArcEpsilon) {
+        CGContextAddLineToPoint(context, static_cast<CGFloat>(x2), static_cast<CGFloat>(y2));
+        return;
+    }
+
+    const double phi = x_axis_rotation_degrees * M_PI / 180.0;
+    const double cos_phi = std::cos(phi);
+    const double sin_phi = std::sin(phi);
+
+    const double dx2 = (x1 - x2) / 2.0;
+    const double dy2 = (y1 - y2) / 2.0;
+    const double x1p = (cos_phi * dx2) + (sin_phi * dy2);
+    const double y1p = (-sin_phi * dx2) + (cos_phi * dy2);
+
+    const double x1p2 = x1p * x1p;
+    const double y1p2 = y1p * y1p;
+
+    double rx2 = rx * rx;
+    double ry2 = ry * ry;
+    const double lambda = (x1p2 / rx2) + (y1p2 / ry2);
+    if (lambda > 1.0) {
+        const double scale = std::sqrt(lambda);
+        rx *= scale;
+        ry *= scale;
+        rx2 = rx * rx;
+        ry2 = ry * ry;
+    }
+
+    const double numerator = (rx2 * ry2) - (rx2 * y1p2) - (ry2 * x1p2);
+    const double denominator = (rx2 * y1p2) + (ry2 * x1p2);
+    if (std::fabs(denominator) < kArcEpsilon) {
+        CGContextAddLineToPoint(context, static_cast<CGFloat>(x2), static_cast<CGFloat>(y2));
+        return;
+    }
+
+    double center_scale = std::sqrt(std::max(0.0, numerator / denominator));
+    if (large_arc_flag == sweep_flag) {
+        center_scale = -center_scale;
+    }
+
+    const double cxp = center_scale * ((rx * y1p) / ry);
+    const double cyp = center_scale * (-(ry * x1p) / rx);
+
+    const double cx = (cos_phi * cxp) - (sin_phi * cyp) + ((x1 + x2) / 2.0);
+    const double cy = (sin_phi * cxp) + (cos_phi * cyp) + ((y1 + y2) / 2.0);
+
+    const double ux = (x1p - cxp) / rx;
+    const double uy = (y1p - cyp) / ry;
+    const double vx = (-x1p - cxp) / rx;
+    const double vy = (-y1p - cyp) / ry;
+
+    double start_angle = std::atan2(uy, ux);
+    double delta_angle = SignedVectorAngle(ux, uy, vx, vy);
+    if (!sweep_flag && delta_angle > 0.0) {
+        delta_angle -= 2.0 * M_PI;
+    } else if (sweep_flag && delta_angle < 0.0) {
+        delta_angle += 2.0 * M_PI;
+    }
+
+    const int segment_count = std::max(1, static_cast<int>(std::ceil(std::fabs(delta_angle) / (M_PI / 2.0))));
+    const double segment_angle = delta_angle / static_cast<double>(segment_count);
+
+    for (int i = 0; i < segment_count; ++i) {
+        const double theta1 = start_angle + (segment_angle * static_cast<double>(i));
+        const double theta2 = theta1 + segment_angle;
+        const double alpha = (4.0 / 3.0) * std::tan((theta2 - theta1) / 4.0);
+
+        const double cos_theta1 = std::cos(theta1);
+        const double sin_theta1 = std::sin(theta1);
+        const double cos_theta2 = std::cos(theta2);
+        const double sin_theta2 = std::sin(theta2);
+
+        const double cp1x_u = cos_theta1 - (alpha * sin_theta1);
+        const double cp1y_u = sin_theta1 + (alpha * cos_theta1);
+        const double cp2x_u = cos_theta2 + (alpha * sin_theta2);
+        const double cp2y_u = sin_theta2 - (alpha * cos_theta2);
+
+        const CGPoint cp1 = MapUnitArcPoint(cp1x_u, cp1y_u, cx, cy, rx, ry, cos_phi, sin_phi);
+        const CGPoint cp2 = MapUnitArcPoint(cp2x_u, cp2y_u, cx, cy, rx, ry, cos_phi, sin_phi);
+        const CGPoint end = MapUnitArcPoint(cos_theta2, sin_theta2, cx, cy, rx, ry, cos_phi, sin_phi);
+
+        CGContextAddCurveToPoint(context, cp1.x, cp1.y, cp2.x, cp2.y, end.x, end.y);
+    }
+}
+
+bool BuildPathFromData(CGContextRef context, const std::string& path_data) {
+    size_t index = 0;
+    char command = '\0';
+
+    double current_x = 0.0;
+    double current_y = 0.0;
+    double start_x = 0.0;
+    double start_y = 0.0;
+
+    double last_cubic_ctrl_x = 0.0;
+    double last_cubic_ctrl_y = 0.0;
+    double last_quad_ctrl_x = 0.0;
+    double last_quad_ctrl_y = 0.0;
+    bool has_last_cubic = false;
+    bool has_last_quad = false;
+
+    while (index < path_data.size()) {
+        SkipPathDelimiters(path_data, index);
+        if (index >= path_data.size()) {
+            break;
+        }
+
+        const char token = path_data[index];
+        if (std::isalpha(static_cast<unsigned char>(token))) {
+            command = token;
+            ++index;
+        } else if (command == '\0') {
+            ++index;
+            continue;
+        }
+
+        const bool relative = std::islower(static_cast<unsigned char>(command));
+        const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(command)));
+
+        if (upper == 'M') {
+            double x = 0.0;
+            double y = 0.0;
+            if (!ParsePathNumber(path_data, index, x) || !ParsePathNumber(path_data, index, y)) {
+                break;
+            }
+            if (relative) {
+                x += current_x;
+                y += current_y;
+            }
+            CGContextMoveToPoint(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+            current_x = x;
+            current_y = y;
+            start_x = x;
+            start_y = y;
+
+            while (HasMorePathNumbers(path_data, index)) {
+                if (!ParsePathNumber(path_data, index, x) || !ParsePathNumber(path_data, index, y)) {
+                    break;
+                }
+                if (relative) {
+                    x += current_x;
+                    y += current_y;
+                }
+                CGContextAddLineToPoint(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+                current_x = x;
+                current_y = y;
+            }
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        if (upper == 'L') {
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, x) && ParsePathNumber(path_data, index, y)) {
+                if (relative) {
+                    x += current_x;
+                    y += current_y;
+                }
+                CGContextAddLineToPoint(context, static_cast<CGFloat>(x), static_cast<CGFloat>(y));
+                current_x = x;
+                current_y = y;
+            }
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        if (upper == 'H') {
+            double x = 0.0;
+            while (ParsePathNumber(path_data, index, x)) {
+                if (relative) {
+                    x += current_x;
+                }
+                CGContextAddLineToPoint(context, static_cast<CGFloat>(x), static_cast<CGFloat>(current_y));
+                current_x = x;
+            }
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        if (upper == 'V') {
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, y)) {
+                if (relative) {
+                    y += current_y;
+                }
+                CGContextAddLineToPoint(context, static_cast<CGFloat>(current_x), static_cast<CGFloat>(y));
+                current_y = y;
+            }
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        if (upper == 'C') {
+            double x1 = 0.0;
+            double y1 = 0.0;
+            double x2 = 0.0;
+            double y2 = 0.0;
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, x1) &&
+                   ParsePathNumber(path_data, index, y1) &&
+                   ParsePathNumber(path_data, index, x2) &&
+                   ParsePathNumber(path_data, index, y2) &&
+                   ParsePathNumber(path_data, index, x) &&
+                   ParsePathNumber(path_data, index, y)) {
+                if (relative) {
+                    x1 += current_x;
+                    y1 += current_y;
+                    x2 += current_x;
+                    y2 += current_y;
+                    x += current_x;
+                    y += current_y;
+                }
+                CGContextAddCurveToPoint(context,
+                                         static_cast<CGFloat>(x1),
+                                         static_cast<CGFloat>(y1),
+                                         static_cast<CGFloat>(x2),
+                                         static_cast<CGFloat>(y2),
+                                         static_cast<CGFloat>(x),
+                                         static_cast<CGFloat>(y));
+                current_x = x;
+                current_y = y;
+                last_cubic_ctrl_x = x2;
+                last_cubic_ctrl_y = y2;
+                has_last_cubic = true;
+                has_last_quad = false;
+            }
+            continue;
+        }
+
+        if (upper == 'S') {
+            double x2 = 0.0;
+            double y2 = 0.0;
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, x2) &&
+                   ParsePathNumber(path_data, index, y2) &&
+                   ParsePathNumber(path_data, index, x) &&
+                   ParsePathNumber(path_data, index, y)) {
+                double x1 = current_x;
+                double y1 = current_y;
+                if (has_last_cubic) {
+                    x1 = 2.0 * current_x - last_cubic_ctrl_x;
+                    y1 = 2.0 * current_y - last_cubic_ctrl_y;
+                }
+
+                if (relative) {
+                    x2 += current_x;
+                    y2 += current_y;
+                    x += current_x;
+                    y += current_y;
+                }
+
+                CGContextAddCurveToPoint(context,
+                                         static_cast<CGFloat>(x1),
+                                         static_cast<CGFloat>(y1),
+                                         static_cast<CGFloat>(x2),
+                                         static_cast<CGFloat>(y2),
+                                         static_cast<CGFloat>(x),
+                                         static_cast<CGFloat>(y));
+
+                current_x = x;
+                current_y = y;
+                last_cubic_ctrl_x = x2;
+                last_cubic_ctrl_y = y2;
+                has_last_cubic = true;
+                has_last_quad = false;
+            }
+            continue;
+        }
+
+        if (upper == 'Q') {
+            double x1 = 0.0;
+            double y1 = 0.0;
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, x1) &&
+                   ParsePathNumber(path_data, index, y1) &&
+                   ParsePathNumber(path_data, index, x) &&
+                   ParsePathNumber(path_data, index, y)) {
+                if (relative) {
+                    x1 += current_x;
+                    y1 += current_y;
+                    x += current_x;
+                    y += current_y;
+                }
+
+                CGContextAddQuadCurveToPoint(context,
+                                             static_cast<CGFloat>(x1),
+                                             static_cast<CGFloat>(y1),
+                                             static_cast<CGFloat>(x),
+                                             static_cast<CGFloat>(y));
+
+                current_x = x;
+                current_y = y;
+                last_quad_ctrl_x = x1;
+                last_quad_ctrl_y = y1;
+                has_last_quad = true;
+                has_last_cubic = false;
+            }
+            continue;
+        }
+
+        if (upper == 'T') {
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, x) && ParsePathNumber(path_data, index, y)) {
+                double x1 = current_x;
+                double y1 = current_y;
+                if (has_last_quad) {
+                    x1 = 2.0 * current_x - last_quad_ctrl_x;
+                    y1 = 2.0 * current_y - last_quad_ctrl_y;
+                }
+
+                if (relative) {
+                    x += current_x;
+                    y += current_y;
+                }
+
+                CGContextAddQuadCurveToPoint(context,
+                                             static_cast<CGFloat>(x1),
+                                             static_cast<CGFloat>(y1),
+                                             static_cast<CGFloat>(x),
+                                             static_cast<CGFloat>(y));
+
+                current_x = x;
+                current_y = y;
+                last_quad_ctrl_x = x1;
+                last_quad_ctrl_y = y1;
+                has_last_quad = true;
+                has_last_cubic = false;
+            }
+            continue;
+        }
+
+        if (upper == 'A') {
+            double rx = 0.0;
+            double ry = 0.0;
+            double angle = 0.0;
+            double large_arc = 0.0;
+            double sweep = 0.0;
+            double x = 0.0;
+            double y = 0.0;
+            while (ParsePathNumber(path_data, index, rx) &&
+                   ParsePathNumber(path_data, index, ry) &&
+                   ParsePathNumber(path_data, index, angle) &&
+                   ParsePathNumber(path_data, index, large_arc) &&
+                   ParsePathNumber(path_data, index, sweep) &&
+                   ParsePathNumber(path_data, index, x) &&
+                   ParsePathNumber(path_data, index, y)) {
+                if (relative) {
+                    x += current_x;
+                    y += current_y;
+                }
+
+                AddArcAsBezier(context,
+                               current_x,
+                               current_y,
+                               rx,
+                               ry,
+                               angle,
+                               std::fabs(large_arc) > 0.0,
+                               std::fabs(sweep) > 0.0,
+                               x,
+                               y);
+                current_x = x;
+                current_y = y;
+            }
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        if (upper == 'Z') {
+            CGContextClosePath(context);
+            current_x = start_x;
+            current_y = start_y;
+            has_last_cubic = false;
+            has_last_quad = false;
+            continue;
+        }
+
+        ++index;
+    }
+
+    return true;
+}
+
+std::map<std::string, std::string> ParseInlineStyle(const std::string& style_text) {
+    std::map<std::string, std::string> out;
+    std::stringstream stream(style_text);
+    std::string token;
+    while (std::getline(stream, token, ';')) {
+        const auto separator = token.find(':');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const auto key = Lower(Trim(token.substr(0, separator)));
+        const auto value = Trim(token.substr(separator + 1));
+        if (!key.empty() && !value.empty()) {
+            out[key] = value;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> ReadAttrOrStyle(const XmlNode& node, const std::map<std::string, std::string>& inline_style, const std::string& key) {
+    const auto attr_it = node.attributes.find(key);
+    if (attr_it != node.attributes.end()) {
+        return attr_it->second;
+    }
+    const auto css_it = inline_style.find(key);
+    if (css_it != inline_style.end()) {
+        return css_it->second;
+    }
+    return std::nullopt;
+}
+
+double ParseCoordinate(const std::string& raw, double fallback) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return fallback;
+    }
+
+    if (*end_ptr == '%') {
+        return parsed / 100.0;
+    }
+    return parsed;
+}
+
+double ParseOffset(const std::string& raw) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return 0.0;
+    }
+
+    char* end_ptr = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return 0.0;
+    }
+
+    if (*end_ptr == '%') {
+        return std::clamp(parsed / 100.0, 0.0, 1.0);
+    }
+    return std::clamp(parsed, 0.0, 1.0);
+}
+
+double ParseDouble(const std::string& raw, double fallback) {
+    const auto trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+
+    char* end_ptr = nullptr;
+    const double parsed = std::strtod(trimmed.c_str(), &end_ptr);
+    if (end_ptr == trimmed.c_str()) {
+        return fallback;
+    }
+
+    if (*end_ptr == '%') {
+        return parsed / 100.0;
+    }
+    return parsed;
+}
+
+CGAffineTransform ParseTransformList(const std::string& raw) {
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    size_t i = 0;
+
+    while (i < raw.size()) {
+        while (i < raw.size() && (std::isspace(static_cast<unsigned char>(raw[i])) || raw[i] == ',')) {
+            ++i;
+        }
+        if (i >= raw.size()) {
+            break;
+        }
+
+        const size_t name_start = i;
+        while (i < raw.size() && std::isalpha(static_cast<unsigned char>(raw[i]))) {
+            ++i;
+        }
+        if (i <= name_start) {
+            ++i;
+            continue;
+        }
+
+        const std::string name = Lower(raw.substr(name_start, i - name_start));
+        while (i < raw.size() && std::isspace(static_cast<unsigned char>(raw[i]))) {
+            ++i;
+        }
+        if (i >= raw.size() || raw[i] != '(') {
+            continue;
+        }
+        ++i;
+
+        std::vector<double> params;
+        while (i < raw.size() && raw[i] != ')') {
+            while (i < raw.size() && (std::isspace(static_cast<unsigned char>(raw[i])) || raw[i] == ',')) {
+                ++i;
+            }
+            if (i >= raw.size() || raw[i] == ')') {
+                break;
+            }
+
+            const char* start = raw.c_str() + i;
+            char* end_ptr = nullptr;
+            const double value = std::strtod(start, &end_ptr);
+            if (end_ptr == start) {
+                ++i;
+                continue;
+            }
+            params.push_back(value);
+            i = static_cast<size_t>(end_ptr - raw.c_str());
+        }
+
+        if (i < raw.size() && raw[i] == ')') {
+            ++i;
+        }
+
+        CGAffineTransform current = CGAffineTransformIdentity;
+        if (name == "matrix" && params.size() >= 6) {
+            current = CGAffineTransformMake(static_cast<CGFloat>(params[0]),
+                                            static_cast<CGFloat>(params[1]),
+                                            static_cast<CGFloat>(params[2]),
+                                            static_cast<CGFloat>(params[3]),
+                                            static_cast<CGFloat>(params[4]),
+                                            static_cast<CGFloat>(params[5]));
+        } else if (name == "translate" && !params.empty()) {
+            const double tx = params[0];
+            const double ty = params.size() > 1 ? params[1] : 0.0;
+            current = CGAffineTransformMakeTranslation(static_cast<CGFloat>(tx), static_cast<CGFloat>(ty));
+        } else if (name == "scale" && !params.empty()) {
+            const double sx = params[0];
+            const double sy = params.size() > 1 ? params[1] : sx;
+            current = CGAffineTransformMakeScale(static_cast<CGFloat>(sx), static_cast<CGFloat>(sy));
+        } else if (name == "rotate" && !params.empty()) {
+            const double angle_rad = params[0] * M_PI / 180.0;
+            if (params.size() > 2) {
+                const double cx = params[1];
+                const double cy = params[2];
+                current = CGAffineTransformIdentity;
+                current = CGAffineTransformTranslate(current, static_cast<CGFloat>(cx), static_cast<CGFloat>(cy));
+                current = CGAffineTransformRotate(current, static_cast<CGFloat>(angle_rad));
+                current = CGAffineTransformTranslate(current, static_cast<CGFloat>(-cx), static_cast<CGFloat>(-cy));
+            } else {
+                current = CGAffineTransformMakeRotation(static_cast<CGFloat>(angle_rad));
+            }
+        } else if (name == "skewx" && !params.empty()) {
+            const CGFloat tangent = static_cast<CGFloat>(std::tan(params[0] * M_PI / 180.0));
+            current = CGAffineTransformMake(1.0f, 0.0f, tangent, 1.0f, 0.0f, 0.0f);
+        } else if (name == "skewy" && !params.empty()) {
+            const CGFloat tangent = static_cast<CGFloat>(std::tan(params[0] * M_PI / 180.0));
+            current = CGAffineTransformMake(1.0f, tangent, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+
+        // SVG applies listed transforms from left-to-right.
+        transform = CGAffineTransformConcat(current, transform);
+    }
+
+    return transform;
+}
+
+std::optional<std::string> ExtractPaintURLId(const std::string& paint) {
+    const std::string trimmed = Trim(paint);
+    const std::string lower = Lower(trimmed);
+    if (lower.rfind("url(", 0) != 0) {
+        return std::nullopt;
+    }
+    const auto close = trimmed.find(')');
+    if (close == std::string::npos || close <= 4) {
+        return std::nullopt;
+    }
+
+    std::string inside = Trim(trimmed.substr(4, close - 4));
+    if (inside.size() >= 2 &&
+        ((inside.front() == '\'' && inside.back() == '\'') || (inside.front() == '"' && inside.back() == '"'))) {
+        inside = inside.substr(1, inside.size() - 2);
+    }
+
+    if (!inside.empty() && inside.front() == '#') {
+        inside.erase(inside.begin());
+    }
+    if (inside.empty()) {
+        return std::nullopt;
+    }
+    return inside;
+}
+
+void CollectGradients(const XmlNode& node, GradientMap& gradients) {
+    if (node.name == "linearGradient" || node.name == "radialGradient") {
+        GradientDefinition gradient;
+        gradient.type = node.name == "linearGradient" ? GradientType::kLinear : GradientType::kRadial;
+
+        const auto id_it = node.attributes.find("id");
+        if (id_it != node.attributes.end()) {
+            gradient.id = id_it->second;
+        }
+
+        const auto units_it = node.attributes.find("gradientUnits");
+        if (units_it != node.attributes.end()) {
+            gradient.user_space_units = Lower(Trim(units_it->second)) == "userspaceonuse";
+        }
+
+        const auto transform_it = node.attributes.find("gradientTransform");
+        if (transform_it != node.attributes.end()) {
+            gradient.transform = ParseTransformList(transform_it->second);
+        }
+
+        if (gradient.type == GradientType::kLinear) {
+            const auto x1_it = node.attributes.find("x1");
+            const auto y1_it = node.attributes.find("y1");
+            const auto x2_it = node.attributes.find("x2");
+            const auto y2_it = node.attributes.find("y2");
+
+            gradient.x1 = x1_it != node.attributes.end() ? ParseCoordinate(x1_it->second, 0.0) : 0.0;
+            gradient.y1 = y1_it != node.attributes.end() ? ParseCoordinate(y1_it->second, 0.0) : 0.0;
+            gradient.x2 = x2_it != node.attributes.end() ? ParseCoordinate(x2_it->second, 1.0) : 1.0;
+            gradient.y2 = y2_it != node.attributes.end() ? ParseCoordinate(y2_it->second, 0.0) : 0.0;
+        } else {
+            const auto cx_it = node.attributes.find("cx");
+            const auto cy_it = node.attributes.find("cy");
+            const auto r_it = node.attributes.find("r");
+            const auto fx_it = node.attributes.find("fx");
+            const auto fy_it = node.attributes.find("fy");
+
+            gradient.cx = cx_it != node.attributes.end() ? ParseCoordinate(cx_it->second, 0.5) : 0.5;
+            gradient.cy = cy_it != node.attributes.end() ? ParseCoordinate(cy_it->second, 0.5) : 0.5;
+            gradient.r = r_it != node.attributes.end() ? ParseCoordinate(r_it->second, 0.5) : 0.5;
+            gradient.fx = fx_it != node.attributes.end() ? ParseCoordinate(fx_it->second, gradient.cx) : gradient.cx;
+            gradient.fy = fy_it != node.attributes.end() ? ParseCoordinate(fy_it->second, gradient.cy) : gradient.cy;
+        }
+
+        for (const auto& stop_node : node.children) {
+            if (stop_node.name != "stop") {
+                continue;
+            }
+
+            const auto style_it = stop_node.attributes.find("style");
+            const auto inline_style = style_it != stop_node.attributes.end() ? ParseInlineStyle(style_it->second) : std::map<std::string, std::string>{};
+
+            GradientStop stop;
+            stop.offset = 0.0;
+            stop.color = StyleResolver::ParseColor("black");
+            stop.opacity = 1.0;
+
+            if (const auto offset = ReadAttrOrStyle(stop_node, inline_style, "offset"); offset.has_value()) {
+                stop.offset = ParseOffset(*offset);
+            }
+
+            if (const auto stop_color = ReadAttrOrStyle(stop_node, inline_style, "stop-color"); stop_color.has_value()) {
+                const auto parsed_color = StyleResolver::ParseColor(*stop_color);
+                if (parsed_color.is_valid) {
+                    stop.color = parsed_color;
+                }
+            }
+
+            if (const auto stop_opacity = ReadAttrOrStyle(stop_node, inline_style, "stop-opacity"); stop_opacity.has_value()) {
+                stop.opacity = std::clamp(ParseDouble(*stop_opacity, 1.0), 0.0, 1.0);
+            }
+
+            gradient.stops.push_back(stop);
+        }
+
+        if (gradient.stops.empty()) {
+            GradientStop start;
+            start.offset = 0.0;
+            start.color = StyleResolver::ParseColor("black");
+            gradient.stops.push_back(start);
+
+            GradientStop end;
+            end.offset = 1.0;
+            end.color = StyleResolver::ParseColor("white");
+            gradient.stops.push_back(end);
+        }
+
+        std::sort(gradient.stops.begin(), gradient.stops.end(), [](const GradientStop& lhs, const GradientStop& rhs) {
+            return lhs.offset < rhs.offset;
+        });
+
+        if (!gradient.id.empty()) {
+            gradients[gradient.id] = gradient;
+        }
+    }
+
+    for (const auto& child : node.children) {
+        CollectGradients(child, gradients);
+    }
+}
+
+void ApplyColor(CGContextRef context, const Color& color, float opacity, bool stroke) {
+    if (!color.is_valid || color.is_none) {
+        return;
+    }
+    const CGFloat alpha = std::clamp(color.a * opacity, 0.0f, 1.0f);
+    if (stroke) {
+        CGContextSetRGBStrokeColor(context, color.r, color.g, color.b, alpha);
+    } else {
+        CGContextSetRGBFillColor(context, color.r, color.g, color.b, alpha);
+    }
+}
+
+CGLineJoin LineJoinFromStyle(const std::string& join_style) {
+    const auto lower = Lower(join_style);
+    if (lower == "round") {
+        return kCGLineJoinRound;
+    }
+    if (lower == "bevel") {
+        return kCGLineJoinBevel;
+    }
+    return kCGLineJoinMiter;
+}
+
+CGLineCap LineCapFromStyle(const std::string& cap_style) {
+    const auto lower = Lower(cap_style);
+    if (lower == "round") {
+        return kCGLineCapRound;
+    }
+    if (lower == "square") {
+        return kCGLineCapSquare;
+    }
+    return kCGLineCapButt;
+}
+
+bool PaintGradientFill(CGContextRef context,
+                       CGPathRef path,
+                       const ResolvedStyle& style,
+                       const GradientMap& gradients,
+                       double inherited_opacity) {
+    const auto gradient_id = ExtractPaintURLId(style.fill_paint);
+    if (!gradient_id.has_value()) {
+        return false;
+    }
+
+    const auto gradient_it = gradients.find(*gradient_id);
+    if (gradient_it == gradients.end()) {
+        return false;
+    }
+
+    const auto& gradient_def = gradient_it->second;
+    if (gradient_def.stops.empty()) {
+        return false;
+    }
+
+    std::vector<CGFloat> locations;
+    locations.reserve(gradient_def.stops.size());
+
+    std::vector<CGFloat> components;
+    components.reserve(gradient_def.stops.size() * 4);
+
+    for (const auto& stop : gradient_def.stops) {
+        const auto color = stop.color.is_valid ? stop.color : StyleResolver::ParseColor("black");
+        const double alpha = std::clamp(color.a * stop.opacity * inherited_opacity, 0.0, 1.0);
+
+        locations.push_back(static_cast<CGFloat>(std::clamp(stop.offset, 0.0, 1.0)));
+        components.push_back(static_cast<CGFloat>(color.r));
+        components.push_back(static_cast<CGFloat>(color.g));
+        components.push_back(static_cast<CGFloat>(color.b));
+        components.push_back(static_cast<CGFloat>(alpha));
+    }
+
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGGradientRef gradient = CGGradientCreateWithColorComponents(color_space,
+                                                                 components.data(),
+                                                                 locations.data(),
+                                                                 locations.size());
+    CGColorSpaceRelease(color_space);
+
+    if (gradient == nullptr) {
+        return false;
+    }
+
+    const CGRect bbox = CGPathGetPathBoundingBox(path);
+    const auto resolve_x = [&](double value) -> double {
+        return gradient_def.user_space_units ? value : (bbox.origin.x + value * bbox.size.width);
+    };
+    const auto resolve_y = [&](double value) -> double {
+        return gradient_def.user_space_units ? value : (bbox.origin.y + value * bbox.size.height);
+    };
+
+    CGContextSaveGState(context);
+    CGContextAddPath(context, path);
+    CGContextClip(context);
+
+    if (!CGAffineTransformEqualToTransform(gradient_def.transform, CGAffineTransformIdentity)) {
+        CGContextConcatCTM(context, gradient_def.transform);
+    }
+
+    if (gradient_def.type == GradientType::kLinear) {
+        const CGPoint start = CGPointMake(static_cast<CGFloat>(resolve_x(gradient_def.x1)), static_cast<CGFloat>(resolve_y(gradient_def.y1)));
+        const CGPoint end = CGPointMake(static_cast<CGFloat>(resolve_x(gradient_def.x2)), static_cast<CGFloat>(resolve_y(gradient_def.y2)));
+
+        CGContextDrawLinearGradient(context,
+                                    gradient,
+                                    start,
+                                    end,
+                                    kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+    } else {
+        const CGPoint center = CGPointMake(static_cast<CGFloat>(resolve_x(gradient_def.cx)), static_cast<CGFloat>(resolve_y(gradient_def.cy)));
+        const CGPoint focal = CGPointMake(static_cast<CGFloat>(resolve_x(gradient_def.fx)), static_cast<CGFloat>(resolve_y(gradient_def.fy)));
+
+        const CGFloat radius = gradient_def.user_space_units
+            ? static_cast<CGFloat>(gradient_def.r)
+            : static_cast<CGFloat>(gradient_def.r * std::max(bbox.size.width, bbox.size.height));
+
+        CGContextDrawRadialGradient(context,
+                                    gradient,
+                                    focal,
+                                    0.0,
+                                    center,
+                                    radius,
+                                    kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+    }
+
+    CGContextRestoreGState(context);
+    CGGradientRelease(gradient);
+    return true;
+}
+
+void DrawText(CGContextRef context, const ShapeGeometry& geometry, const ResolvedStyle& style) {
+    if (geometry.text.empty()) {
+        return;
+    }
+
+    CFStringRef text = CFStringCreateWithCString(kCFAllocatorDefault, geometry.text.c_str(), kCFStringEncodingUTF8);
+    CFStringRef font_name = CFStringCreateWithCString(kCFAllocatorDefault,
+                                                      style.font_family.empty() ? "Helvetica" : style.font_family.c_str(),
+                                                      kCFStringEncodingUTF8);
+
+    CTFontRef font = CTFontCreateWithName(font_name, style.font_size > 0.0f ? style.font_size : 16.0f, nullptr);
+
+    CGFloat fill_r = 0.0;
+    CGFloat fill_g = 0.0;
+    CGFloat fill_b = 0.0;
+    CGFloat fill_a = 1.0;
+    if (style.fill.is_valid && !style.fill.is_none) {
+        fill_r = style.fill.r;
+        fill_g = style.fill.g;
+        fill_b = style.fill.b;
+        fill_a = std::clamp(style.fill.a * style.opacity * style.fill_opacity, 0.0f, 1.0f);
+    }
+
+    const CGFloat components[] = {fill_r, fill_g, fill_b, fill_a};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGColorRef cg_color = CGColorCreate(cs, components);
+
+    CFTypeRef keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
+    CFTypeRef values[] = {font, cg_color};
+    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
+                                               reinterpret_cast<const void**>(keys),
+                                               reinterpret_cast<const void**>(values),
+                                               2,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+
+    CFAttributedStringRef attr_string = CFAttributedStringCreate(kCFAllocatorDefault, text, attrs);
+    CTLineRef line = CTLineCreateWithAttributedString(attr_string);
+
+    CGContextSaveGState(context);
+    CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+    CGContextSetTextPosition(context, static_cast<CGFloat>(geometry.x), static_cast<CGFloat>(geometry.y));
+    CTLineDraw(line, context);
+    CGContextRestoreGState(context);
+
+    CFRelease(line);
+    CFRelease(attr_string);
+    CFRelease(attrs);
+    CGColorRelease(cg_color);
+    CGColorSpaceRelease(cs);
+    CFRelease(font);
+    CFRelease(font_name);
+    CFRelease(text);
+}
+
+void PaintNode(const XmlNode& node,
+               const StyleResolver& style_resolver,
+               const GeometryEngine& geometry_engine,
+               const ResolvedStyle* parent_style,
+               CGContextRef context,
+               const GradientMap& gradients,
+               const RenderOptions& options,
+               RenderError& error) {
+    const auto style = style_resolver.Resolve(node, parent_style, options);
+
+    CGContextSaveGState(context);
+    const auto transform_it = node.attributes.find("transform");
+    if (transform_it != node.attributes.end()) {
+        CGContextConcatCTM(context, ParseTransformList(transform_it->second));
+    }
+
+    if (node.name == "defs") {
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    if (node.name == "svg" || node.name == "g") {
+        for (const auto& child : node.children) {
+            PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+            if (error.code != RenderErrorCode::kNone) {
+                CGContextRestoreGState(context);
+                return;
+            }
+        }
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    auto geometry = geometry_engine.Build(node);
+    if (!geometry.has_value()) {
+        for (const auto& child : node.children) {
+            PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+            if (error.code != RenderErrorCode::kNone) {
+                CGContextRestoreGState(context);
+                return;
+            }
+        }
+        CGContextRestoreGState(context);
+        return;
+    }
+
+    CGContextSetLineWidth(context, style.stroke_width);
+    CGContextSetLineCap(context, LineCapFromStyle(style.stroke_line_cap));
+    CGContextSetLineJoin(context, LineJoinFromStyle(style.stroke_line_join));
+    CGContextSetMiterLimit(context, std::max(style.stroke_miter_limit, 1.0f));
+    if (style.stroke_dasharray.empty()) {
+        CGContextSetLineDash(context, static_cast<CGFloat>(style.stroke_dashoffset), nullptr, 0);
+    } else {
+        bool has_positive_dash = false;
+        std::vector<CGFloat> dash_pattern;
+        dash_pattern.reserve(style.stroke_dasharray.size());
+        for (const auto value : style.stroke_dasharray) {
+            const auto clamped = std::max(value, 0.0f);
+            if (clamped > 0.0f) {
+                has_positive_dash = true;
+            }
+            dash_pattern.push_back(static_cast<CGFloat>(clamped));
+        }
+
+        if (has_positive_dash) {
+            CGContextSetLineDash(context,
+                                 static_cast<CGFloat>(style.stroke_dashoffset),
+                                 dash_pattern.data(),
+                                 dash_pattern.size());
+        } else {
+            CGContextSetLineDash(context, static_cast<CGFloat>(style.stroke_dashoffset), nullptr, 0);
+        }
+    }
+
+    switch (geometry->type) {
+        case ShapeType::kRect: {
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x),
+                                           static_cast<CGFloat>(geometry->y),
+                                           static_cast<CGFloat>(geometry->width),
+                                           static_cast<CGFloat>(geometry->height));
+            if (geometry->rx > 0.0 || geometry->ry > 0.0) {
+                const CGFloat radius = static_cast<CGFloat>(std::max(geometry->rx, geometry->ry));
+                const CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, nullptr);
+                CGContextAddPath(context, path);
+                CGPathRelease(path);
+            } else {
+                CGContextAddRect(context, rect);
+            }
+            break;
+        }
+        case ShapeType::kCircle: {
+            const double radius = geometry->rx;
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x - radius),
+                                           static_cast<CGFloat>(geometry->y - radius),
+                                           static_cast<CGFloat>(radius * 2.0),
+                                           static_cast<CGFloat>(radius * 2.0));
+            CGContextAddEllipseInRect(context, rect);
+            break;
+        }
+        case ShapeType::kEllipse: {
+            const CGRect rect = CGRectMake(static_cast<CGFloat>(geometry->x - geometry->rx),
+                                           static_cast<CGFloat>(geometry->y - geometry->ry),
+                                           static_cast<CGFloat>(geometry->rx * 2.0),
+                                           static_cast<CGFloat>(geometry->ry * 2.0));
+            CGContextAddEllipseInRect(context, rect);
+            break;
+        }
+        case ShapeType::kLine: {
+            if (geometry->points.size() >= 2) {
+                CGContextMoveToPoint(context,
+                                     static_cast<CGFloat>(geometry->points[0].x),
+                                     static_cast<CGFloat>(geometry->points[0].y));
+                CGContextAddLineToPoint(context,
+                                        static_cast<CGFloat>(geometry->points[1].x),
+                                        static_cast<CGFloat>(geometry->points[1].y));
+            }
+            break;
+        }
+        case ShapeType::kPolygon:
+        case ShapeType::kPolyline: {
+            if (!geometry->points.empty()) {
+                CGContextMoveToPoint(context,
+                                     static_cast<CGFloat>(geometry->points[0].x),
+                                     static_cast<CGFloat>(geometry->points[0].y));
+                for (size_t i = 1; i < geometry->points.size(); ++i) {
+                    CGContextAddLineToPoint(context,
+                                            static_cast<CGFloat>(geometry->points[i].x),
+                                            static_cast<CGFloat>(geometry->points[i].y));
+                }
+                if (geometry->type == ShapeType::kPolygon) {
+                    CGContextClosePath(context);
+                }
+            }
+            break;
+        }
+        case ShapeType::kPath: {
+            BuildPathFromData(context, geometry->path_data);
+            break;
+        }
+        case ShapeType::kText: {
+            DrawText(context, *geometry, style);
+            break;
+        }
+        case ShapeType::kUnknown:
+            break;
+    }
+
+    if (geometry->type != ShapeType::kText) {
+        CGPathRef path = CGContextCopyPath(context);
+        if (path != nullptr) {
+            CGContextBeginPath(context);
+        }
+
+        const bool has_fill_color = style.fill.is_valid && !style.fill.is_none;
+        const bool has_stroke = style.stroke.is_valid && !style.stroke.is_none;
+
+        bool gradient_fill_drawn = false;
+        if (path != nullptr) {
+            gradient_fill_drawn = PaintGradientFill(context,
+                                                    path,
+                                                    style,
+                                                    gradients,
+                                                    static_cast<double>(style.opacity * style.fill_opacity));
+        }
+
+        const CGPathDrawingMode fill_mode = style.fill_rule == "evenodd" ? kCGPathEOFill : kCGPathFill;
+
+        if (!gradient_fill_drawn && has_fill_color && path != nullptr) {
+            ApplyColor(context, style.fill, style.opacity * style.fill_opacity, false);
+            CGContextBeginPath(context);
+            CGContextAddPath(context, path);
+            CGContextDrawPath(context, fill_mode);
+        }
+
+        if (has_stroke && path != nullptr) {
+            ApplyColor(context, style.stroke, style.opacity * style.stroke_opacity, true);
+            CGContextBeginPath(context);
+            CGContextAddPath(context, path);
+            CGContextDrawPath(context, kCGPathStroke);
+        }
+
+        if (path != nullptr) {
+            CGPathRelease(path);
+        }
+    }
+
+    for (const auto& child : node.children) {
+        PaintNode(child, style_resolver, geometry_engine, &style, context, gradients, options, error);
+        if (error.code != RenderErrorCode::kNone) {
+            CGContextRestoreGState(context);
+            return;
+        }
+    }
+
+    CGContextRestoreGState(context);
+}
+
+} // namespace
+
+bool PaintEngine::Paint(const SvgDocument& document,
+                        const LayoutResult& layout,
+                        const RenderOptions& options,
+                        const CompatFlags&,
+                        RasterSurface& surface,
+                        RenderError& error) const {
+    const auto context = surface.context();
+    if (context == nullptr) {
+        error.code = RenderErrorCode::kRenderFailed;
+        error.message = "Missing render context";
+        return false;
+    }
+
+    const StyleResolver style_resolver;
+    const GeometryEngine geometry_engine;
+
+    GradientMap gradients;
+    CollectGradients(document.root, gradients);
+
+    CGContextSaveGState(context);
+    // SVG uses a top-left origin with positive Y downward.
+    CGContextTranslateCTM(context, 0.0, static_cast<CGFloat>(layout.height));
+    CGContextScaleCTM(context, 1.0, -1.0);
+
+    if (layout.view_box_width > 0.0 && layout.view_box_height > 0.0) {
+        const double scale_x = static_cast<double>(layout.width) / layout.view_box_width;
+        const double scale_y = static_cast<double>(layout.height) / layout.view_box_height;
+
+        const CGAffineTransform viewbox_transform = CGAffineTransformMake(static_cast<CGFloat>(scale_x),
+                                                                          0.0,
+                                                                          0.0,
+                                                                          static_cast<CGFloat>(scale_y),
+                                                                          static_cast<CGFloat>(-layout.view_box_x * scale_x),
+                                                                          static_cast<CGFloat>(-layout.view_box_y * scale_y));
+        CGContextConcatCTM(context, viewbox_transform);
+    }
+
+    PaintNode(document.root, style_resolver, geometry_engine, nullptr, context, gradients, options, error);
+    CGContextRestoreGState(context);
+    return error.code == RenderErrorCode::kNone;
+}
+
+} // namespace csvg
