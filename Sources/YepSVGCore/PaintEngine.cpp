@@ -4610,6 +4610,10 @@ std::string ResolveGenericFontFamily(const std::string& family) {
     return Trim(family);
 }
 
+static std::string SystemFallbackFamily() {
+    return "Helvetica";
+}
+
 std::vector<std::string> ResolveTextFontFamilies(const std::string& font_family) {
     std::vector<std::string> families;
     std::stringstream stream(font_family);
@@ -4627,7 +4631,7 @@ std::vector<std::string> ResolveTextFontFamilies(const std::string& font_family)
         }
     }
     if (families.empty()) {
-        families.push_back("Helvetica");
+        families.push_back(SystemFallbackFamily());
     }
     return families;
 }
@@ -5033,8 +5037,68 @@ void CollectTextRuns(const XmlNode& node,
     }
 }
 
+static bool FontFamilyExistsFast(const std::string& family_name) {
+    return FontFamilyExists(family_name);
+}
+
+static bool IsGenericFamily(const std::string& v) {
+    const std::string s = Lower(Trim(v));
+    return s == "serif" ||
+           s == "sans-serif" ||
+           s == "monospace" ||
+           s == "cursive" ||
+           s == "fantasy" ||
+           s == "system-ui" ||
+           s == "ui-serif" ||
+           s == "ui-sans-serif" ||
+           s == "ui-monospace" ||
+           s == "ui-rounded" ||
+           s == "emoji" ||
+           s == "math" ||
+           s == "fangsong";
+}
+static std::string MapGenericToAppleFamily(const std::string& generic) {
+    const std::string g = Lower(Trim(generic));
+    if (g == "sans-serif" || g == "ui-sans-serif" || g == "system-ui") return "Helvetica";
+    if (g == "serif" || g == "ui-serif") return "Times New Roman";
+    if (g == "monospace" || g == "ui-monospace") return "Courier";
+    if (g == "ui-rounded") return "Helvetica";
+    if (g == "cursive") return "Snell Roundhand";
+    if (g == "fantasy") return "Papyrus";
+    if (g == "emoji") return "Apple Color Emoji";
+    return "";
+}
+
+std::string ResolveCssFontFamily(const std::string& font_family_css) {
+    const auto candidates = ResolveTextFontFamilies(font_family_css);
+
+    for (const auto& raw : candidates) {
+        const std::string name = Trim(raw);
+        if (name.empty()) continue;
+
+        if (IsGenericFamily(name)) {
+            const std::string mapped = MapGenericToAppleFamily(name);
+            if (!mapped.empty() && FontFamilyExistsFast(mapped)) {
+                return mapped;
+            }
+            continue;
+        }
+
+        if (FontFamilyExistsFast(name)) {
+            return name;
+        }
+    }
+
+    const std::string fallback = SystemFallbackFamily();
+    if (!fallback.empty() && FontFamilyExistsFast(fallback)) {
+        return fallback;
+    }
+
+    return !candidates.empty() ? candidates.front() : SystemFallbackFamily();
+}
+
 CTFontRef CreateTextFontForStyle(const ResolvedStyle& style) {
-    const std::string resolved_family = ResolveTextFontFamily(style.font_family);
+    const std::string resolved_family = ResolveCssFontFamily(style.font_family);
     const CGFloat font_size = style.font_size > 0.0f ? style.font_size : 16.0f;
 
     CFStringRef family_name = CFStringCreateWithCString(kCFAllocatorDefault,
