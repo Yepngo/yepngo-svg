@@ -1,0 +1,18 @@
+<svg width="300" height="200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Self-intersecting path that creates a square hole with evenodd -->
+    <clipPath id="evenoddPath">
+      <path clip-rule="evenodd" d="M50,50 L150,50 L150,150 L50,150 Z M75,75 L125,75 L125,125 L75,125 Z"/>
+    </clipPath>
+    <!-- Same path with nonzero (no hole) -->
+    <clipPath id="nonzeroPath">
+      <path clip-rule="nonzero" d="M50,50 L150,50 L150,150 L50,150 Z M75,75 L125,75 L125,125 L75,125 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- evenodd should create a frame (hole in center) -->
+  <rect x="0" y="0" width="150" height="150" fill="red" clip-path="url(#evenoddPath)"/>
+
+  <!-- nonzero should be solid (no hole) -->
+  <rect x="150" y="0" width="150" height="150" fill="blue" clip-path="url(#nonzeroPath)"/>
+</svg>

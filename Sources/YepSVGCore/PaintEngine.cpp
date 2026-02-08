@@ -2354,6 +2354,16 @@ std::optional<std::string> ResolveFilterID(const XmlNode& node,
     return ExtractPaintURLId(*filter_value);
 }
 
+std::optional<std::string> ResolveClipPathID(const XmlNode& node,
+                                              const std::map<std::string, std::string>& inline_style,
+                                              const std::map<std::string, std::string>* matched_css_properties) {
+    const auto clip_path_value = ReadAttrOrStyle(node, inline_style, matched_css_properties, "clip-path");
+    if (!clip_path_value.has_value()) {
+        return std::nullopt;
+    }
+    return ExtractPaintURLId(*clip_path_value);
+}
+
 std::optional<PixelSurface> RenderNodeToSurface(const XmlNode& node,
                                                 const StyleResolver& style_resolver,
                                                 const GeometryEngine& geometry_engine,
@@ -4175,6 +4185,141 @@ CGImageRef CreateImageFromSurface(const PixelSurface& surface) {
     return image;
 }
 
+// Forward declaration
+bool AddGeometryPath(CGContextRef context, const ShapeGeometry& geometry);
+
+bool ApplyClipPath(CGContextRef context,
+                   const XmlNode* clip_path_node,
+                   const XmlNode& clipped_node,
+                   const GeometryEngine& geometry_engine) {
+    if (clip_path_node == nullptr || clip_path_node->children.empty()) {
+        return false;
+    }
+
+    // Check clipPathUnits attribute (default is userSpaceOnUse)
+    const auto units_it = clip_path_node->attributes.find("clipPathUnits");
+    const bool object_bounding_box = (units_it != clip_path_node->attributes.end() &&
+                                      Lower(Trim(units_it->second)) == "objectboundingbox");
+
+    // For objectBoundingBox, we need the element's bounding box
+    CGRect bbox = CGRectZero;
+    if (object_bounding_box) {
+        // Compute bounding box of the clipped element
+        const auto clipped_geometry = geometry_engine.Build(clipped_node);
+        if (clipped_geometry.has_value()) {
+            // Compute bounding box from geometry
+            switch (clipped_geometry->type) {
+                case ShapeType::kRect:
+                    bbox = CGRectMake(clipped_geometry->x,
+                                     clipped_geometry->y,
+                                     clipped_geometry->width,
+                                     clipped_geometry->height);
+                    break;
+                case ShapeType::kCircle:
+                    bbox = CGRectMake(clipped_geometry->x - clipped_geometry->rx,
+                                     clipped_geometry->y - clipped_geometry->rx,
+                                     clipped_geometry->rx * 2.0,
+                                     clipped_geometry->rx * 2.0);
+                    break;
+                case ShapeType::kEllipse:
+                    bbox = CGRectMake(clipped_geometry->x - clipped_geometry->rx,
+                                     clipped_geometry->y - clipped_geometry->ry,
+                                     clipped_geometry->rx * 2.0,
+                                     clipped_geometry->ry * 2.0);
+                    break;
+                default:
+                    // For other shapes, we'll use userSpaceOnUse behavior as fallback
+                    bbox = CGRectMake(0, 0,
+                                     geometry_engine.viewport_width(),
+                                     geometry_engine.viewport_height());
+                    break;
+            }
+        }
+    }
+
+    // TODO: Support clipPath transform attribute
+    // The challenge is that we need to apply the transform while building paths,
+    // then undo it before rendering, but CGContextClip() is tied to the graphics state.
+    // For now, transforms on clipPath elements are ignored.
+
+    // Build paths from all children and apply clipping for each
+    // Note: Each shape can have its own clip-rule attribute
+    bool has_clipped = false;
+
+    for (const auto& child : clip_path_node->children) {
+        // Compute geometry for this shape
+        const auto geometry = geometry_engine.Build(child);
+        if (!geometry.has_value()) {
+            continue;
+        }
+
+        // For objectBoundingBox, scale and translate coordinates
+        ShapeGeometry scaled_geometry = *geometry;
+        if (object_bounding_box) {
+            const double scale_x = bbox.size.width;
+            const double scale_y = bbox.size.height;
+            const double offset_x = bbox.origin.x;
+            const double offset_y = bbox.origin.y;
+
+            // Scale coordinates based on shape type
+            switch (scaled_geometry.type) {
+                case ShapeType::kRect:
+                    scaled_geometry.x = offset_x + scaled_geometry.x * scale_x;
+                    scaled_geometry.y = offset_y + scaled_geometry.y * scale_y;
+                    scaled_geometry.width *= scale_x;
+                    scaled_geometry.height *= scale_y;
+                    break;
+                case ShapeType::kCircle:
+                    scaled_geometry.x = offset_x + scaled_geometry.x * scale_x;
+                    scaled_geometry.y = offset_y + scaled_geometry.y * scale_y;
+                    scaled_geometry.rx *= std::max(scale_x, scale_y);
+                    break;
+                case ShapeType::kEllipse:
+                    scaled_geometry.x = offset_x + scaled_geometry.x * scale_x;
+                    scaled_geometry.y = offset_y + scaled_geometry.y * scale_y;
+                    scaled_geometry.rx *= scale_x;
+                    scaled_geometry.ry *= scale_y;
+                    break;
+                case ShapeType::kPolygon:
+                case ShapeType::kPolyline:
+                case ShapeType::kLine:
+                    for (auto& point : scaled_geometry.points) {
+                        point.x = offset_x + point.x * scale_x;
+                        point.y = offset_y + point.y * scale_y;
+                    }
+                    break;
+                default:
+                    // For path and others, we'd need to parse and scale the path data
+                    // For now, use as-is (will be incorrect for objectBoundingBox)
+                    break;
+            }
+        }
+
+        // Add the geometry to the context path
+        if (!AddGeometryPath(context, scaled_geometry)) {
+            continue;
+        }
+
+        // Check for clip-rule attribute on THIS child element
+        const auto child_clip_rule_it = child.attributes.find("clip-rule");
+        const std::string clip_rule = child_clip_rule_it != child.attributes.end()
+            ? Lower(Trim(child_clip_rule_it->second))
+            : "nonzero";
+
+        // Apply clipping with the appropriate rule for this shape
+        // Note: Multiple clips intersect (AND operation)
+        if (clip_rule == "evenodd") {
+            CGContextEOClip(context);
+        } else {
+            CGContextClip(context);
+        }
+
+        has_clipped = true;
+    }
+
+    return has_clipped;
+}
+
 bool PaintNodeWithFilter(const XmlNode& node,
                          const std::map<std::string, std::string>& inline_style,
                          const std::map<std::string, std::string>& matched_css_properties,
@@ -5702,6 +5847,18 @@ void PaintNode(const XmlNode& node,
                             error)) {
         CGContextRestoreGState(context);
         return;
+    }
+
+    // Apply clip-path if specified
+    const auto clip_path_id = ResolveClipPathID(node, inline_style, &matched_css_properties);
+    if (clip_path_id.has_value()) {
+        const auto clip_it = id_map.find(*clip_path_id);
+        if (clip_it != id_map.end() && clip_it->second != nullptr) {
+            const std::string clip_name = Lower(LocalName(clip_it->second->name));
+            if (clip_name == "clippath") {
+                ApplyClipPath(context, clip_it->second, node, geometry_engine);
+            }
+        }
     }
 
     if (node.name == "use") {

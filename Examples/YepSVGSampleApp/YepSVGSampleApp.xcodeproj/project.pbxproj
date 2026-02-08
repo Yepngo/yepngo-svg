@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -11,6 +11,9 @@
 		2F87FEA15F3E9349CB5E7457 /* YepSVGSampleApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB2B0DE486AF04418A67E31 /* YepSVGSampleApp.swift */; };
 		33694B9AF743DD60CEE20E96 /* W3CSuite in Resources */ = {isa = PBXBuildFile; fileRef = 7A0F0BF0AE3B7F7532C4249D /* W3CSuite */; };
 		46E56C8838F69F9796F8CBCD /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E81E98DC94C1855C25C46DB /* ContentView.swift */; };
+		4860C3BB2F38414C00123E21 /* YepSVG in Frameworks */ = {isa = PBXBuildFile; productRef = 4860C3BA2F38414C00123E21 /* YepSVG */; };
+		4860C3BD2F38414C00123E21 /* YepSVGKingfisher in Frameworks */ = {isa = PBXBuildFile; productRef = 4860C3BC2F38414C00123E21 /* YepSVGKingfisher */; };
+		4860C3BF2F38414C00123E21 /* YepSVGSwiftUI in Frameworks */ = {isa = PBXBuildFile; productRef = 4860C3BE2F38414C00123E21 /* YepSVGSwiftUI */; };
 		7123379E7505B5567E16F363 /* BadgeDemoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C2672C1B3FC038C8524DB77 /* BadgeDemoView.swift */; };
 		BB360D002B8E66E540F43D42 /* badge.svg in Resources */ = {isa = PBXBuildFile; fileRef = CFD19634D41F85D6F752D820 /* badge.svg */; };
 		CC7731954AA8D39A2AA1C5DF /* BasicBadgeSVG.swift in Sources */ = {isa = PBXBuildFile; fileRef = 627FBD0177C1852C50F373CC /* BasicBadgeSVG.swift */; };
@@ -26,7 +29,7 @@
 		7A0F0BF0AE3B7F7532C4249D /* W3CSuite */ = {isa = PBXFileReference; lastKnownFileType = folder; name = W3CSuite; path = YepSVGSampleApp/Resources/W3CSuite; sourceTree = SOURCE_ROOT; };
 		9346390E46F7625597DF0E98 /* YepSVGSampleApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = YepSVGSampleApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BD642969E4F96865167410B7 /* yepngo-svg */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "yepngo-svg"; path = ../..; sourceTree = SOURCE_ROOT; };
-		CFD19634D41F85D6F752D820 /* badge.svg */ = {isa = PBXFileReference; path = badge.svg; sourceTree = "<group>"; };
+		CFD19634D41F85D6F752D820 /* badge.svg */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = badge.svg; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -34,7 +37,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				4860C3BB2F38414C00123E21 /* YepSVG in Frameworks */,
 				2D24EC5AD8A3C91B1BA06398 /* YepSVG in Frameworks */,
+				4860C3BF2F38414C00123E21 /* YepSVGSwiftUI in Frameworks */,
+				4860C3BD2F38414C00123E21 /* YepSVGKingfisher in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -108,6 +114,9 @@
 			name = YepSVGSampleApp;
 			packageProductDependencies = (
 				C47C4344B7FA69D3DA7B940D /* YepSVG */,
+				4860C3BA2F38414C00123E21 /* YepSVG */,
+				4860C3BC2F38414C00123E21 /* YepSVGKingfisher */,
+				4860C3BE2F38414C00123E21 /* YepSVGSwiftUI */,
 			);
 			productName = YepSVGSampleApp;
 			productReference = 9346390E46F7625597DF0E98 /* YepSVGSampleApp.app */;
@@ -139,9 +148,8 @@
 			mainGroup = DFDFC05B8B7C1B5096711861;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				54F2D7D4B73B975AFF1987E4 /* XCLocalSwiftPackageReference "../.." */,
+				4860C3B92F38414C00123E21 /* XCLocalSwiftPackageReference "../../../yepngo-svg" */,
 			);
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -365,13 +373,25 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		54F2D7D4B73B975AFF1987E4 /* XCLocalSwiftPackageReference "../.." */ = {
+		4860C3B92F38414C00123E21 /* XCLocalSwiftPackageReference "../../../yepngo-svg" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = ../..;
+			relativePath = "../../../yepngo-svg";
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		4860C3BA2F38414C00123E21 /* YepSVG */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YepSVG;
+		};
+		4860C3BC2F38414C00123E21 /* YepSVGKingfisher */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YepSVGKingfisher;
+		};
+		4860C3BE2F38414C00123E21 /* YepSVGSwiftUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = YepSVGSwiftUI;
+		};
 		C47C4344B7FA69D3DA7B940D /* YepSVG */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = YepSVG;
