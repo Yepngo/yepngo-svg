@@ -2364,6 +2364,16 @@ std::optional<std::string> ResolveClipPathID(const XmlNode& node,
     return ExtractPaintURLId(*clip_path_value);
 }
 
+std::optional<std::string> ResolveMaskID(const XmlNode& node,
+                                          const std::map<std::string, std::string>& inline_style,
+                                          const std::map<std::string, std::string>* matched_css_properties) {
+    const auto mask_value = ReadAttrOrStyle(node, inline_style, matched_css_properties, "mask");
+    if (!mask_value.has_value()) {
+        return std::nullopt;
+    }
+    return ExtractPaintURLId(*mask_value);
+}
+
 std::optional<PixelSurface> RenderNodeToSurface(const XmlNode& node,
                                                 const StyleResolver& style_resolver,
                                                 const GeometryEngine& geometry_engine,
@@ -4434,6 +4444,223 @@ bool ApplyClipPath(CGContextRef context,
     return has_path;
 }
 
+bool ApplyMask(CGContextRef context,
+               const XmlNode* mask_node,
+               const XmlNode& masked_node,
+               const StyleResolver& style_resolver,
+               const GeometryEngine& geometry_engine,
+               const GradientMap& gradients,
+               const PatternMap& patterns,
+               const NodeIdMap& id_map,
+               const ColorProfileMap& color_profiles,
+               const RenderOptions& options,
+               RenderError& error) {
+    if (mask_node == nullptr || mask_node->children.empty()) {
+        return false;
+    }
+
+    // Check maskUnits attribute (default is objectBoundingBox for masks, unlike clipPath)
+    const auto units_it = mask_node->attributes.find("maskUnits");
+    const bool object_bounding_box = (units_it == mask_node->attributes.end() ||
+                                      Lower(Trim(units_it->second)) == "objectboundingbox");
+
+    // Check maskContentUnits attribute (default is userSpaceOnUse)
+    const auto content_units_it = mask_node->attributes.find("maskContentUnits");
+    const bool content_object_bounding_box = (content_units_it != mask_node->attributes.end() &&
+                                              Lower(Trim(content_units_it->second)) == "objectboundingbox");
+
+    // Compute bounding box of the masked element
+    const auto masked_geometry = geometry_engine.Build(masked_node);
+    if (!masked_geometry.has_value()) {
+        return false;
+    }
+
+    CGRect bbox = CGRectZero;
+    switch (masked_geometry->type) {
+        case ShapeType::kRect:
+            bbox = CGRectMake(masked_geometry->x,
+                            masked_geometry->y,
+                            masked_geometry->width,
+                            masked_geometry->height);
+            break;
+        case ShapeType::kCircle:
+            bbox = CGRectMake(masked_geometry->x - masked_geometry->rx,
+                            masked_geometry->y - masked_geometry->rx,
+                            masked_geometry->rx * 2.0,
+                            masked_geometry->rx * 2.0);
+            break;
+        case ShapeType::kEllipse:
+            bbox = CGRectMake(masked_geometry->x - masked_geometry->rx,
+                            masked_geometry->y - masked_geometry->ry,
+                            masked_geometry->rx * 2.0,
+                            masked_geometry->ry * 2.0);
+            break;
+        default:
+            // For other shapes, use viewport as fallback
+            bbox = CGRectMake(0, 0,
+                            geometry_engine.viewport_width(),
+                            geometry_engine.viewport_height());
+            break;
+    }
+
+    // If maskUnits is objectBoundingBox, compute the mask region
+    // Default mask region is x=-10%, y=-10%, width=120%, height=120% (in objectBoundingBox)
+    CGRect mask_region;
+    if (object_bounding_box) {
+        // Parse mask region attributes or use defaults
+        const auto x_it = mask_node->attributes.find("x");
+        const auto y_it = mask_node->attributes.find("y");
+        const auto width_it = mask_node->attributes.find("width");
+        const auto height_it = mask_node->attributes.find("height");
+
+        const double x_frac = x_it != mask_node->attributes.end() ? std::stod(x_it->second) : -0.1;
+        const double y_frac = y_it != mask_node->attributes.end() ? std::stod(y_it->second) : -0.1;
+        const double w_frac = width_it != mask_node->attributes.end() ? std::stod(width_it->second) : 1.2;
+        const double h_frac = height_it != mask_node->attributes.end() ? std::stod(height_it->second) : 1.2;
+
+        mask_region = CGRectMake(
+            bbox.origin.x + x_frac * bbox.size.width,
+            bbox.origin.y + y_frac * bbox.size.height,
+            w_frac * bbox.size.width,
+            h_frac * bbox.size.height
+        );
+    } else {
+        // userSpaceOnUse - mask region in absolute coordinates
+        const auto x_it = mask_node->attributes.find("x");
+        const auto y_it = mask_node->attributes.find("y");
+        const auto width_it = mask_node->attributes.find("width");
+        const auto height_it = mask_node->attributes.find("height");
+
+        const double x_val = x_it != mask_node->attributes.end() ? std::stod(x_it->second) :
+                            bbox.origin.x - 0.1 * bbox.size.width;
+        const double y_val = y_it != mask_node->attributes.end() ? std::stod(y_it->second) :
+                            bbox.origin.y - 0.1 * bbox.size.height;
+        const double w_val = width_it != mask_node->attributes.end() ? std::stod(width_it->second) :
+                            1.2 * bbox.size.width;
+        const double h_val = height_it != mask_node->attributes.end() ? std::stod(height_it->second) :
+                            1.2 * bbox.size.height;
+
+        mask_region = CGRectMake(x_val, y_val, w_val, h_val);
+    }
+
+    // Create a bitmap context to render the mask content
+    const size_t width = static_cast<size_t>(std::max(1.0, std::ceil(mask_region.size.width)));
+    const size_t height = static_cast<size_t>(std::max(1.0, std::ceil(mask_region.size.height)));
+    const size_t bytes_per_row = width * 4;
+
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef mask_bitmap = CGBitmapContextCreate(
+        nullptr,
+        width,
+        height,
+        8,
+        bytes_per_row,
+        color_space,
+        static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast)
+    );
+    CGColorSpaceRelease(color_space);
+
+    if (mask_bitmap == nullptr) {
+        return false;
+    }
+
+    // Set up coordinate system for mask rendering
+    CGContextTranslateCTM(mask_bitmap, 0.0, static_cast<CGFloat>(height));
+    CGContextScaleCTM(mask_bitmap, 1.0, -1.0);
+
+    // Translate to mask region origin
+    CGContextTranslateCTM(mask_bitmap, -mask_region.origin.x, -mask_region.origin.y);
+
+    // If maskContentUnits is objectBoundingBox, apply additional scaling
+    if (content_object_bounding_box) {
+        CGContextTranslateCTM(mask_bitmap, bbox.origin.x, bbox.origin.y);
+        CGContextScaleCTM(mask_bitmap, bbox.size.width, bbox.size.height);
+    }
+
+    // Render mask content to the bitmap
+    std::set<std::string> local_active_use_ids;
+    std::set<std::string> local_active_pattern_ids;
+    RenderError local_error;
+
+    for (const auto& child : mask_node->children) {
+        PaintNode(child,
+                 style_resolver,
+                 geometry_engine,
+                 nullptr,  // parent_style
+                 mask_bitmap,
+                 gradients,
+                 patterns,
+                 id_map,
+                 color_profiles,
+                 local_active_use_ids,
+                 local_active_pattern_ids,
+                 options,
+                 local_error,
+                 true,   // apply_filters
+                 false); // suppress_current_opacity
+    }
+
+    // Extract pixel data from mask bitmap
+    unsigned char* mask_data = static_cast<unsigned char*>(CGBitmapContextGetData(mask_bitmap));
+    if (mask_data == nullptr) {
+        CGContextRelease(mask_bitmap);
+        return false;
+    }
+
+    // Convert RGBA mask to grayscale alpha mask based on luminance
+    // SVG masks use luminance: L = 0.299*R + 0.587*G + 0.114*B
+    // White (255,255,255) = fully visible, Black (0,0,0) = fully transparent
+    const size_t pixel_count = width * height;
+    std::vector<unsigned char> alpha_data(pixel_count);
+
+    for (size_t i = 0; i < pixel_count; i++) {
+        const size_t offset = i * 4;
+        const unsigned char r = mask_data[offset];
+        const unsigned char g = mask_data[offset + 1];
+        const unsigned char b = mask_data[offset + 2];
+        const unsigned char a = mask_data[offset + 3];
+
+        // Calculate luminance
+        const double luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+
+        // Combine with alpha channel
+        const double combined_alpha = (luminance / 255.0) * (a / 255.0);
+        alpha_data[i] = static_cast<unsigned char>(combined_alpha * 255.0);
+    }
+
+    CGContextRelease(mask_bitmap);
+
+    // Create grayscale image from alpha data
+    CGColorSpaceRef gray_space = CGColorSpaceCreateDeviceGray();
+    CGContextRef alpha_context = CGBitmapContextCreate(
+        alpha_data.data(),
+        width,
+        height,
+        8,
+        width,  // 1 byte per pixel for grayscale
+        gray_space,
+        kCGImageAlphaNone
+    );
+    CGColorSpaceRelease(gray_space);
+
+    if (alpha_context == nullptr) {
+        return false;
+    }
+
+    CGImageRef mask_image = CGBitmapContextCreateImage(alpha_context);
+    CGContextRelease(alpha_context);
+
+    if (mask_image == nullptr) {
+        return false;
+    }
+
+    // Apply the mask using CGContextClipToMask
+    CGContextClipToMask(context, mask_region, mask_image);
+    CGImageRelease(mask_image);
+
+    return true;
+}
+
 bool PaintNodeWithFilter(const XmlNode& node,
                          const std::map<std::string, std::string>& inline_style,
                          const std::map<std::string, std::string>& matched_css_properties,
@@ -5974,6 +6201,19 @@ void PaintNode(const XmlNode& node,
             const std::string clip_name = Lower(LocalName(clip_it->second->name));
             if (clip_name == "clippath") {
                 ApplyClipPath(context, clip_it->second, node, geometry_engine);
+            }
+        }
+    }
+
+    // Apply mask if specified
+    const auto mask_id = ResolveMaskID(node, inline_style, &matched_css_properties);
+    if (mask_id.has_value()) {
+        const auto mask_it = id_map.find(*mask_id);
+        if (mask_it != id_map.end() && mask_it->second != nullptr) {
+            const std::string mask_name = Lower(LocalName(mask_it->second->name));
+            if (mask_name == "mask") {
+                ApplyMask(context, mask_it->second, node, style_resolver, geometry_engine,
+                         gradients, patterns, id_map, color_profiles, options, error);
             }
         }
     }

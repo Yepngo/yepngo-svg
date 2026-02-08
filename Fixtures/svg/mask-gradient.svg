@@ -1,0 +1,26 @@
+<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Linear gradient from black to white -->
+    <linearGradient id="fadeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:black;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:gray;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:white;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Mask using the gradient -->
+    <mask id="fadeMask">
+      <rect x="0" y="0" width="400" height="200" fill="url(#fadeGradient)"/>
+    </mask>
+
+    <!-- Colorful gradient for the masked element -->
+    <linearGradient id="colorGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:rgb(255,0,0);stop-opacity:1" />
+      <stop offset="33%" style="stop-color:rgb(255,255,0);stop-opacity:1" />
+      <stop offset="66%" style="stop-color:rgb(0,255,0);stop-opacity:1" />
+      <stop offset="100%" style="stop-color:rgb(0,0,255);stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rectangle with gradient fill, masked with fade effect -->
+  <rect x="0" y="0" width="400" height="200" fill="url(#colorGradient)" mask="url(#fadeMask)"/>
+</svg>
