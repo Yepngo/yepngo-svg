@@ -1,0 +1,18 @@
+<svg width="400" height="200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <clipPath id="textClip">
+      <text x="20" y="100" font-size="80" font-family="Impact">CLIP</text>
+    </clipPath>
+  </defs>
+
+  <!-- Image clipped to text shape -->
+  <rect x="0" y="0" width="400" height="200" fill="url(#gradient)" clip-path="url(#textClip)"/>
+
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:rgb(255,0,0);stop-opacity:1" />
+      <stop offset="50%" style="stop-color:rgb(255,255,0);stop-opacity:1" />
+      <stop offset="100%" style="stop-color:rgb(0,255,0);stop-opacity:1" />
+    </linearGradient>
+  </defs>
+</svg>

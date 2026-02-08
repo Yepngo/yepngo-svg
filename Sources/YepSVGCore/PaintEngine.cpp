@@ -4242,9 +4242,11 @@ bool ApplyClipPath(CGContextRef context,
     // then undo it before rendering, but CGContextClip() is tied to the graphics state.
     // For now, transforms on clipPath elements are ignored.
 
-    // Build paths from all children and apply clipping for each
-    // Note: Each shape can have its own clip-rule attribute
-    bool has_clipped = false;
+    // Build paths from all children first (they UNION together)
+    // Then apply clipping once at the end
+    bool has_path = false;
+    std::string common_clip_rule = "nonzero";
+    bool first_shape = true;
 
     for (const auto& child : clip_path_node->children) {
         // Compute geometry for this shape
@@ -4295,29 +4297,141 @@ bool ApplyClipPath(CGContextRef context,
             }
         }
 
-        // Add the geometry to the context path
-        if (!AddGeometryPath(context, scaled_geometry)) {
+        // Handle text specially - convert glyphs to paths
+        bool path_added = false;
+        if (scaled_geometry.type == ShapeType::kText) {
+            // Extract font attributes
+            const auto font_family_it = child.attributes.find("font-family");
+            const auto font_size_it = child.attributes.find("font-size");
+
+            const std::string font_family = font_family_it != child.attributes.end()
+                ? font_family_it->second
+                : "Helvetica";
+            const double font_size = font_size_it != child.attributes.end()
+                ? std::strtod(font_size_it->second.c_str(), nullptr)
+                : 12.0;
+
+            // Create CTFont
+            CFStringRef family_cf = CFStringCreateWithCString(kCFAllocatorDefault,
+                                                             font_family.c_str(),
+                                                             kCFStringEncodingUTF8);
+            if (family_cf != nullptr) {
+                CTFontRef font = CTFontCreateWithName(family_cf, font_size, nullptr);
+                CFRelease(family_cf);
+
+                if (font != nullptr && !scaled_geometry.text.empty()) {
+                    // Create attributed string
+                    CFStringRef text_cf = CFStringCreateWithCString(kCFAllocatorDefault,
+                                                                   scaled_geometry.text.c_str(),
+                                                                   kCFStringEncodingUTF8);
+                    if (text_cf != nullptr) {
+                        CFStringRef keys[] = {kCTFontAttributeName};
+                        CFTypeRef values[] = {font};
+                        CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
+                                                                  (const void**)&keys,
+                                                                  (const void**)&values,
+                                                                  1,
+                                                                  &kCFTypeDictionaryKeyCallBacks,
+                                                                  &kCFTypeDictionaryValueCallBacks);
+
+                        CFAttributedStringRef attr_string = CFAttributedStringCreate(kCFAllocatorDefault,
+                                                                                     text_cf,
+                                                                                     attrs);
+                        CFRelease(attrs);
+                        CFRelease(text_cf);
+
+                        if (attr_string != nullptr) {
+                            // Create line
+                            CTLineRef line = CTLineCreateWithAttributedString(attr_string);
+                            CFRelease(attr_string);
+
+                            if (line != nullptr) {
+                                // Save context state and position text
+                                CGContextSaveGState(context);
+                                CGContextTranslateCTM(context,
+                                                     scaled_geometry.x,
+                                                     scaled_geometry.y);
+                                // Flip Y axis for text (SVG coords vs CoreText coords)
+                                CGContextScaleCTM(context, 1.0, -1.0);
+
+                                // Get glyph runs
+                                CFArrayRef runs = CTLineGetGlyphRuns(line);
+                                CFIndex run_count = CFArrayGetCount(runs);
+
+                                for (CFIndex i = 0; i < run_count; i++) {
+                                    CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, i);
+                                    CFIndex glyph_count = CTRunGetGlyphCount(run);
+
+                                    // Get glyphs and positions
+                                    std::vector<CGGlyph> glyphs(glyph_count);
+                                    std::vector<CGPoint> positions(glyph_count);
+                                    CTRunGetGlyphs(run, CFRangeMake(0, glyph_count), glyphs.data());
+                                    CTRunGetPositions(run, CFRangeMake(0, glyph_count), positions.data());
+
+                                    // Convert each glyph to path
+                                    for (CFIndex j = 0; j < glyph_count; j++) {
+                                        CGPathRef glyph_path = CTFontCreatePathForGlyph(font,
+                                                                                       glyphs[j],
+                                                                                       nullptr);
+                                        if (glyph_path != nullptr) {
+                                            CGContextSaveGState(context);
+                                            CGContextTranslateCTM(context,
+                                                                positions[j].x,
+                                                                positions[j].y);
+                                            CGContextAddPath(context, glyph_path);
+                                            CGContextRestoreGState(context);
+                                            CGPathRelease(glyph_path);
+                                            path_added = true;
+                                        }
+                                    }
+                                }
+
+                                CGContextRestoreGState(context);
+                                CFRelease(line);
+                            }
+                        }
+                    }
+                    CFRelease(font);
+                }
+            }
+        } else {
+            // Regular shapes - use AddGeometryPath
+            path_added = AddGeometryPath(context, scaled_geometry);
+        }
+
+        if (!path_added) {
             continue;
         }
 
-        // Check for clip-rule attribute on THIS child element
+        has_path = true;
+
+        // Track clip-rule for this shape
         const auto child_clip_rule_it = child.attributes.find("clip-rule");
-        const std::string clip_rule = child_clip_rule_it != child.attributes.end()
+        const std::string this_clip_rule = child_clip_rule_it != child.attributes.end()
             ? Lower(Trim(child_clip_rule_it->second))
             : "nonzero";
 
-        // Apply clipping with the appropriate rule for this shape
-        // Note: Multiple clips intersect (AND operation)
-        if (clip_rule == "evenodd") {
+        // Keep track of common clip-rule (if all shapes have same rule)
+        if (first_shape) {
+            common_clip_rule = this_clip_rule;
+            first_shape = false;
+        } else if (common_clip_rule != this_clip_rule) {
+            // Mixed clip-rules - default to nonzero
+            common_clip_rule = "nonzero";
+        }
+    }
+
+    // Apply clipping ONCE after all paths are built
+    // This makes multiple shapes UNION together (as per SVG spec)
+    if (has_path) {
+        if (common_clip_rule == "evenodd") {
             CGContextEOClip(context);
         } else {
             CGContextClip(context);
         }
-
-        has_clipped = true;
     }
 
-    return has_clipped;
+    return has_path;
 }
 
 bool PaintNodeWithFilter(const XmlNode& node,
@@ -4735,6 +4849,9 @@ bool AddGeometryPath(CGContextRef context, const ShapeGeometry& geometry) {
             BuildPathFromData(context, geometry.path_data);
             return true;
         case ShapeType::kText:
+            // Text clipping requires converting glyphs to paths
+            // This is handled below with text-specific logic
+            return false;
         case ShapeType::kImage:
         case ShapeType::kUnknown:
             return false;

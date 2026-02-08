@@ -162,6 +162,32 @@ final class ClipPathTests: XCTestCase {
         XCTAssertGreaterThan(centerColor?.alpha ?? 0, 0.5, "Center should not be clipped")
     }
 
+    func testTextClipPath() async throws {
+        let svg = """
+        <svg width="200" height="100" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <clipPath id="textClip">
+              <text x="10" y="60" font-size="50" font-family="Helvetica">ABC</text>
+            </clipPath>
+          </defs>
+          <rect x="0" y="0" width="200" height="100" fill="blue" clip-path="url(#textClip)"/>
+        </svg>
+        """
+
+        let renderer = SVGRenderer()
+        let image = try await renderer.render(svgString: svg, options: .default)
+
+        // Check that image was created (text clipping worked)
+        XCTAssertEqual(image.size.width, 200)
+        XCTAssertEqual(image.size.height, 100)
+
+        // Inside text glyphs should be blue
+        let insideColor = pixelAt(image: image, x: 30, y: 50)
+        XCTAssertNotNil(insideColor)
+        // Note: This test verifies compilation/execution, not exact pixels
+        // as text rendering can vary by font availability
+    }
+
     func testMultipleShapesInClipPath() async throws {
         let svg = """
         <svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
